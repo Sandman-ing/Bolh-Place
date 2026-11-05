@@ -3,6 +3,7 @@ name = "bolh-place"
 description = "Bolh Place — документы и холсты для планов"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [lib]

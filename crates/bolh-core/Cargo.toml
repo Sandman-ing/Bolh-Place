@@ -3,6 +3,7 @@ name = "bolh-core"
 description = "Ядро Bolh Place: пространства, формат файлов, история, корзина. Без интерфейса."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

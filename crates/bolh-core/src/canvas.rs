@@ -605,7 +605,7 @@ mod tests {
         assert_eq!((n.x, n.y), (0.0, 0.0), "125-120=5 → 0, 77-70=7 → 0");
         assert_eq!((n.width, n.height), CARD_SIZE);
         assert_eq!(n.kind, "card");
-        assert_eq!(e.selection(), [id.clone()]);
+        assert_eq!(e.selection(), std::slice::from_ref(&id));
         let id2 = e.add_card(p(125.0, 77.0), None);
         assert_eq!(e.node(&id2).unwrap().x, 5.0);
     }
@@ -676,11 +676,11 @@ mod tests {
             Rect::from_corners(p(200.0, 200.0), p(-200.0, -200.0)),
             false,
         );
-        assert_eq!(e.selection(), [a.clone()]);
+        assert_eq!(e.selection(), std::slice::from_ref(&a));
         e.toggle_selected(&b);
         assert_eq!(e.selection().len(), 2);
         e.toggle_selected(&a);
-        assert_eq!(e.selection(), [b.clone()]);
+        assert_eq!(e.selection(), std::slice::from_ref(&b));
         e.select_in(r(-500.0, -500.0, 10.0, 10.0), true);
         assert_eq!(
             e.selection(),
@@ -762,7 +762,7 @@ mod tests {
         assert_ne!(pasted.id, a);
         assert_eq!(pasted.text, "текст");
         assert_eq!(pasted.x, e.nodes()[0].x + 20.0);
-        assert_eq!(e.selection(), [pasted.id.clone()]);
+        assert_eq!(e.selection(), std::slice::from_ref(&pasted.id));
         assert!(e.duplicate());
         assert_eq!(e.nodes().len(), 3);
         assert!(!e.paste("просто текст", 20.0));

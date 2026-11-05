@@ -2,6 +2,7 @@
 //! формат файлов, история версий, корзина, вложения, настройки, переводы и
 //! проверка обновлений. Поэтому ядро тестируется и в Linux, и в Windows.
 
+pub mod canvas;
 pub mod error;
 pub mod format;
 pub mod fsutil;

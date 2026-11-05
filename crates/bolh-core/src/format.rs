@@ -135,10 +135,9 @@ pub struct Canvas {
     pub format: String,
     pub version: u32,
     pub id: Uuid,
-    /// Объекты холста. Их устройство определит этап 2, пока они хранятся
-    /// как есть и не теряются при сохранении.
+    /// Объекты холста по порядку слоёв: последний — сверху.
     #[serde(default)]
-    pub nodes: Vec<Value>,
+    pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Value>,
     #[serde(flatten)]
@@ -161,6 +160,47 @@ impl Canvas {
 impl Default for Canvas {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Объект на холсте. Поля координат названы как в формате JSON Canvas,
+/// чтобы экспорт для Obsidian (раздел 8) был простым.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    #[serde(default)]
+    pub id: String,
+    /// Вид объекта: `card` — карточка. Неизвестные виды от новых версий
+    /// программы хранятся как есть.
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default)]
+    pub width: f64,
+    #[serde(default)]
+    pub height: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+pub const CARD: &str = "card";
+
+impl Node {
+    pub fn card(id: impl Into<String>, x: f64, y: f64, width: f64, height: f64) -> Self {
+        Node {
+            id: id.into(),
+            kind: CARD.into(),
+            x,
+            y,
+            width,
+            height,
+            text: String::new(),
+            extra: Map::new(),
+        }
     }
 }
 
@@ -301,6 +341,8 @@ mod tests {
         let s = String::from_utf8(c.to_bytes()).unwrap();
         assert!(s.contains("\"viewport\""), "неизвестное поле сохранилось");
         assert!(s.contains("\"kind\": \"card\""));
+        let Content::Canvas(cv) = &c else { panic!() };
+        assert_eq!((cv.nodes[0].x, cv.nodes[0].y), (10.0, -5.0));
     }
 
     #[test]

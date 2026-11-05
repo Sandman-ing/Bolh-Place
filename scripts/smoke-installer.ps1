@@ -19,9 +19,17 @@ function Save-Screen([string]$name) {
 
 function App-Processes { @(Get-Process bolh-place -ErrorAction SilentlyContinue) }
 
+# Ждём только сам процесс: Start-Process -Wait ждал бы и запущенную
+# установщиком программу, то есть вечно.
+function Wait-Exit($p, [int]$seconds, [string]$what) {
+    $null = $p.Handle  # без этого ExitCode после выхода пустой
+    if (-not $p.WaitForExit($seconds * 1000)) { throw "$what не завершился за $seconds с" }
+    if ($p.ExitCode -ne 0) { throw "$what вернул код $($p.ExitCode)" }
+}
+
 function Run-Installer([string[]]$arguments) {
-    $p = Start-Process -FilePath $Installer -ArgumentList $arguments -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw "Установщик вернул код $($p.ExitCode)" }
+    $p = Start-Process -FilePath $Installer -ArgumentList $arguments -PassThru
+    Wait-Exit $p 180 "Установщик"
 }
 
 function Write-Settings([string]$theme) {
@@ -75,8 +83,8 @@ $light | Stop-Process -Force
 Start-Sleep -Seconds 2
 
 # 6. Удаление.
-$un = Start-Process -FilePath (Join-Path $appDir "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
-if ($un.ExitCode -ne 0) { throw "Удаление вернуло код $($un.ExitCode)" }
+$un = Start-Process -FilePath (Join-Path $appDir "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+Wait-Exit $un 180 "Удаление"
 Start-Sleep -Seconds 3
 if (Test-Path $exe) { throw "После удаления осталась программа" }
 if (-not (Test-Path (Join-Path $space "План.bdoc"))) { throw "Удаление программы задело файлы пространства" }

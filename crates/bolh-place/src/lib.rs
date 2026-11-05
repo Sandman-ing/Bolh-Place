@@ -11,7 +11,8 @@ pub mod updater;
 pub mod workspace;
 
 use gpui_kit::{
-    App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+    App, AppContext as _, Bounds, Pixels, Size, TitlebarOptions, WindowBounds, WindowOptions, px,
+    size,
 };
 
 use bolh_core::settings::Settings;
@@ -28,6 +29,23 @@ pub fn init(settings: &Settings, cx: &mut App) {
     actions::bind_keys(cx);
 }
 
+/// Начальный размер окна: 1280×820, но не больше 90% ширины и 85% высоты
+/// экрана — на ноутбуке 1366×768 окно иначе уходило бы под панель задач.
+pub fn fit_window(screen: Option<Size<Pixels>>) -> Size<Pixels> {
+    let wanted = size(px(1280.), px(820.));
+    match screen {
+        Some(s) => size(
+            wanted.width.min(s.width * 0.9),
+            wanted.height.min(s.height * 0.85),
+        ),
+        None => wanted,
+    }
+}
+
+fn window_size(cx: &App) -> Size<Pixels> {
+    fit_window(cx.primary_display().map(|d| d.bounds().size))
+}
+
 pub fn run() {
     gpui_kit::application()
         .with_assets(assets::AppAssets)
@@ -39,7 +57,7 @@ pub fn run() {
                 .unwrap_or_default();
             init(&settings, cx);
 
-            let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+            let bounds = Bounds::centered(None, window_size(cx), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -60,4 +78,18 @@ pub fn run() {
             .expect("окно Bolh Place не открылось");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_fits_small_screens() {
+        let small = fit_window(Some(size(px(1024.), px(768.))));
+        assert!(small.width <= px(1024.) * 0.9 && small.height <= px(768.) * 0.85);
+        let big = fit_window(Some(size(px(2560.), px(1440.))));
+        assert_eq!(big, size(px(1280.), px(820.)));
+        assert_eq!(fit_window(None), size(px(1280.), px(820.)));
+    }
 }

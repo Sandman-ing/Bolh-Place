@@ -67,6 +67,7 @@ jobs:
         shell: pwsh
         run: ./scripts/build-installer.ps1
       - name: Установить, запустить, обновить, удалить
+        timeout-minutes: 10
         shell: pwsh
         run: ./scripts/smoke-installer.ps1 -Installer "${{ steps.installer.outputs.installer }}"
       - name: Снимки экрана

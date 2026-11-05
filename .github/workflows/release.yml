@@ -68,6 +68,7 @@ jobs:
         run: ./scripts/build-installer.ps1
       - name: Проверка установщика
         if: steps.v.outputs.skip == 'false'
+        timeout-minutes: 10
         shell: pwsh
         run: ./scripts/smoke-installer.ps1 -Installer "${{ steps.installer.outputs.installer }}"
       - name: Подпись для автообновления

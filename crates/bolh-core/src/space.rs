@@ -217,7 +217,9 @@ impl Space {
             let child = rel.join(&name);
             let ft = e.file_type().map_err(io(e.path()))?;
             if ft.is_dir() {
-                let children = self.scan(&child)?;
+                // Нечитаемая папка (нет прав, «System Volume Information» в
+                // корне диска) показывается пустой, а не прячет всё дерево.
+                let children = self.scan(&child).unwrap_or_default();
                 out.push(Entry {
                     rel: child,
                     name,

@@ -354,3 +354,21 @@ fn clicking_a_file_in_the_tree_opens_it(cx: &mut TestAppContext) {
     });
     cx.read(|cx| assert_eq!(ws.read(cx).active_tab().unwrap().title(), "Схема"));
 }
+
+#[gpui_kit::test]
+fn autosave_of_one_tab_is_not_cancelled_by_another(cx: &mut TestAppContext) {
+    let (fx, settings) = fixture(&["Работа"]);
+    let (handle, _ws) = open(cx, settings, &fx.settings_path);
+    step(cx, handle, |window, cx| window.click("new-document", cx));
+    step(cx, handle, |window, cx| window.input("первый", cx));
+    step(cx, handle, |window, cx| window.click("new-document", cx));
+    step(cx, handle, |window, cx| window.input("второй", cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(doc_text(&fx.root, Path::new("Без названия.bdoc")), "первый");
+    assert_eq!(
+        doc_text(&fx.root, Path::new("Без названия 2.bdoc")),
+        "второй"
+    );
+}

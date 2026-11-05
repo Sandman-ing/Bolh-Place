@@ -400,3 +400,26 @@ fn attachments_are_copied_with_free_names() {
     assert_eq!(fs::read(s.root().join(&b)).unwrap(), b"\x89PNG");
     assert!(src.exists(), "оригинал на месте");
 }
+
+#[cfg(unix)]
+#[test]
+fn unreadable_folder_does_not_hide_the_whole_tree() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_d, s) = new_space();
+    s.create_file(Path::new(""), "Видно", FileKind::Document, clock(0))
+        .unwrap();
+    let locked = s.root().join("Закрыто");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // От root права не действуют — тогда проверять нечего (в CI тесты идут не от root).
+    let effective = fs::read_dir(&locked).is_err();
+    let tree = s.tree();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !effective {
+        eprintln!("права не действуют для этого пользователя — пропуск");
+        return;
+    }
+    let tree = tree.expect("дерево строится");
+    let names: Vec<_> = tree.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["Закрыто", "Видно"]);
+}

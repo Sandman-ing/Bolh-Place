@@ -49,6 +49,9 @@ pub struct OpenTab {
     editor: Option<Entity<TextareaState>>,
     /// О чужой правке уже сказали — не повторять каждые две секунды.
     external_noticed: bool,
+    /// Отложенное автосохранение. У каждой вкладки своё: правка в одной
+    /// вкладке не должна отменять сохранение другой.
+    autosave: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -89,7 +92,6 @@ pub struct Workspace {
     status: SharedString,
     pub update: UpdateStatus,
     focus_handle: FocusHandle,
-    autosave: Option<Task<()>>,
     update_task: Option<Task<()>>,
     _poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -141,7 +143,6 @@ impl Workspace {
             status: SharedString::default(),
             update: UpdateStatus::Idle,
             focus_handle: cx.focus_handle(),
-            autosave: None,
             update_task: None,
             _poll: None,
             _subscriptions: subscriptions,
@@ -550,6 +551,7 @@ impl Workspace {
             file,
             editor,
             external_noticed: false,
+            autosave: None,
             _subscriptions: subscriptions,
         });
         let ix = self.tabs.len() - 1;
@@ -588,7 +590,7 @@ impl Workspace {
         }
         doc.set_plain_text(text);
         cx.notify();
-        self.autosave = Some(cx.spawn_in(window, async move |this, cx| {
+        tab.autosave = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(AUTOSAVE_DELAY).await;
             let _ = this.update_in(cx, |this, window, cx| this.save_tab(id, window, cx));
         }));
@@ -628,13 +630,11 @@ impl Workspace {
 
     pub fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.active_tab().map(|t| t.id) {
-            self.autosave = None;
             self.save_tab(id, window, cx);
         }
     }
 
     pub fn save_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.autosave = None;
         let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
         for id in ids {
             self.save_tab(id, window, cx);
@@ -1149,7 +1149,11 @@ impl Workspace {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 // Установщик запущен: он закроет программу и откроет новую.
-                Ok(()) => cx.quit(),
+                // Правки, сделанные пока шло скачивание, — сохранить.
+                Ok(()) => {
+                    this.save_all(window, cx);
+                    cx.quit();
+                }
                 Err(e) => {
                     let text = update_error_text(&e, cx);
                     this.update = UpdateStatus::Failed(text.clone());

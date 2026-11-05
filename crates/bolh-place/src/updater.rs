@@ -4,9 +4,7 @@
 //!
 //! Всё здесь блокирующее — вызывать только в фоновой задаче.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use bolh_core::update::{Release, is_newer, parse_latest, verify};
 
@@ -23,43 +21,34 @@ const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 pub enum UpdateError {
     /// Нет сети или GitHub не ответил.
     Offline,
+    /// GitHub ответил «нет такого» — например, выпусков ещё нет.
+    NotFound,
     /// Подпись не сошлась — запускать нельзя.
     BadSignature,
     Other(String),
 }
 
-fn agent() -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder()
-        .provider(ureq::tls::TlsProvider::NativeTls)
-        .build();
-    ureq::Agent::config_builder()
-        .tls_config(tls)
-        .timeout_global(Some(Duration::from_secs(120)))
-        .user_agent(concat!("BolhPlace/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
-}
-
-fn get(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
-    let resp = agent
-        .get(url)
-        .header(
-            "Accept",
-            "application/vnd.github+json, application/octet-stream",
-        )
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::StatusCode(code) => UpdateError::Other(format!("HTTP {code}")),
-            _ => UpdateError::Offline,
-        })?;
-    let mut bytes = Vec::new();
-    resp.into_body()
-        .into_reader()
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
+fn get(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
+    let resp = minreq::get(url)
+        .with_header("Accept", "application/vnd.github+json, application/octet-stream")
+        .with_header("User-Agent", concat!("BolhPlace/", env!("CARGO_PKG_VERSION")))
+        .with_timeout(120)
+        .with_max_redirects(10)
+        .send_lazy()
         .map_err(|_| UpdateError::Offline)?;
-    if bytes.len() as u64 > limit {
-        return Err(UpdateError::Other("слишком большой файл".into()));
+    if resp.status_code == 404 {
+        return Err(UpdateError::NotFound);
+    }
+    if !(200..300).contains(&resp.status_code) {
+        return Err(UpdateError::Other(format!("HTTP {}", resp.status_code)));
+    }
+    let mut bytes = Vec::new();
+    for b in resp {
+        let (byte, _) = b.map_err(|_| UpdateError::Offline)?;
+        bytes.push(byte);
+        if bytes.len() as u64 > limit {
+            return Err(UpdateError::Other("слишком большой файл".into()));
+        }
     }
     Ok(bytes)
 }
@@ -67,7 +56,11 @@ fn get(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, UpdateErro
 /// Есть ли версия новее установленной. `None` — обновляться не нужно.
 pub fn check(current: &str) -> Result<Option<Release>, UpdateError> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let json = get(&agent(), &url, 4 * 1024 * 1024)?;
+    let json = match get(&url, 4 * 1024 * 1024) {
+        // Выпусков ещё нет — значит, и новее нет.
+        Err(UpdateError::NotFound) => return Ok(None),
+        other => other?,
+    };
     let release = parse_latest(&json).map_err(|e| UpdateError::Other(e.to_string()))?;
     Ok(is_newer(current, &release).then_some(release))
 }
@@ -75,9 +68,8 @@ pub fn check(current: &str) -> Result<Option<Release>, UpdateError> {
 /// Скачивает установщик и подпись, проверяет и кладёт установщик во
 /// временную папку. Возвращает путь к проверенному файлу.
 pub fn download(release: &Release, dir: &Path) -> Result<PathBuf, UpdateError> {
-    let agent = agent();
-    let installer = get(&agent, &release.installer_url, MAX_INSTALLER_BYTES)?;
-    let signature = get(&agent, &release.signature_url, 64 * 1024)?;
+    let installer = get(&release.installer_url, MAX_INSTALLER_BYTES)?;
+    let signature = get(&release.signature_url, 64 * 1024)?;
     let signature = String::from_utf8(signature).map_err(|_| UpdateError::BadSignature)?;
     verify(&installer, &signature, PUBLIC_KEY, release).map_err(|_| UpdateError::BadSignature)?;
     std::fs::create_dir_all(dir).map_err(|e| UpdateError::Other(e.to_string()))?;
@@ -112,5 +104,18 @@ mod tests {
     fn minisign_key_ok(text: &str) -> bool {
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         lines.len() == 2 && lines[0].starts_with("untrusted comment:") && lines[1].len() == 56
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// Настоящий запрос к GitHub. Не в обычном прогоне: зависит от сети.
+    /// `cargo test -p bolh-place -- --ignored live_check`
+    #[test]
+    #[ignore]
+    fn live_check() {
+        let r = super::check("0.0.1");
+        eprintln!("{r:?}");
+        assert!(r.is_ok(), "{r:?}");
     }
 }

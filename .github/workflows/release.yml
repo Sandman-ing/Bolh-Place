@@ -1,0 +1,91 @@
+name: Выпуск
+
+# Выпуск создаётся сам, когда в main попадает новая версия (номер в
+# Cargo.toml, которого ещё нет среди выпусков). Если что-то пошло не так —
+# Actions → «Выпуск» → Run workflow.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release:
+    name: Установщик в GitHub Releases
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Версия и проверка, что такого выпуска ещё нет
+        id: v
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+          gh release view "v$version" --repo "${{ github.repository }}" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Выпуск v$version уже есть — пропускаю."
+            "skip=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+          exit 0
+      - name: Секрет подписи на месте
+        if: steps.v.outputs.skip == 'false'
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if (-not $env:UPDATE_SIGNING_KEY) {
+            throw "Нет секрета UPDATE_SIGNING_KEY: Settings → Secrets and variables → Actions. Инструкция — docs/release.md"
+          }
+      - name: Rust
+        if: steps.v.outputs.skip == 'false'
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        if: steps.v.outputs.skip == 'false'
+      - name: Тесты
+        if: steps.v.outputs.skip == 'false'
+        run: cargo test --workspace --locked
+      - name: Сборка
+        if: steps.v.outputs.skip == 'false'
+        run: cargo build --release --locked -p bolh-place
+      - name: Установщик
+        if: steps.v.outputs.skip == 'false'
+        id: installer
+        shell: pwsh
+        run: ./scripts/build-installer.ps1
+      - name: Проверка установщика
+        if: steps.v.outputs.skip == 'false'
+        shell: pwsh
+        run: ./scripts/smoke-installer.ps1 -Installer "${{ steps.installer.outputs.installer }}"
+      - name: Подпись для автообновления
+        if: steps.v.outputs.skip == 'false'
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: cargo run --release --locked -p bolh-sign -- sign ${{ steps.v.outputs.version }} ${{ steps.installer.outputs.installer }}
+      - name: Выпуск на GitHub
+        if: steps.v.outputs.skip == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.v.outputs.version }}"
+          $exe = "${{ steps.installer.outputs.installer }}"
+          gh release create "v$v" $exe "$exe.minisig" `
+            --repo "${{ github.repository }}" `
+            --target "${{ github.sha }}" `
+            --title "Bolh Place $v" `
+            --notes-file packaging/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw "gh release create: код $LASTEXITCODE" }

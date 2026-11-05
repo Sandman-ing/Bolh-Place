@@ -50,7 +50,12 @@ pub fn run() {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| workspace::Workspace::new(settings, settings_path, window, cx))
+                cx.new(|cx| {
+                    let mut ws = workspace::Workspace::new(settings, settings_path, window, cx);
+                    // Раздел 10: программа сама смотрит, нет ли новой версии.
+                    ws.check_update(false, window, cx);
+                    ws
+                })
             })
             .expect("окно Bolh Place не открылось");
             cx.activate(true);

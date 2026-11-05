@@ -1779,6 +1779,7 @@ fn empty_note(text: SharedString, cx: &App) -> AnyElement {
 fn update_error_text(e: &updater::UpdateError, cx: &App) -> SharedString {
     match e {
         updater::UpdateError::Offline => tr(cx, "update.offline"),
+        updater::UpdateError::NotFound => trf(cx, "update.failed", &[("reason", "404")]),
         updater::UpdateError::BadSignature => tr(cx, "update.bad_signature"),
         updater::UpdateError::Other(reason) => trf(cx, "update.failed", &[("reason", reason)]),
     }

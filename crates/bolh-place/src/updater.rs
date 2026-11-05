@@ -30,8 +30,14 @@ pub enum UpdateError {
 
 fn get(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
     let resp = minreq::get(url)
-        .with_header("Accept", "application/vnd.github+json, application/octet-stream")
-        .with_header("User-Agent", concat!("BolhPlace/", env!("CARGO_PKG_VERSION")))
+        .with_header(
+            "Accept",
+            "application/vnd.github+json, application/octet-stream",
+        )
+        .with_header(
+            "User-Agent",
+            concat!("BolhPlace/", env!("CARGO_PKG_VERSION")),
+        )
         .with_timeout(120)
         .with_max_redirects(10)
         .send_lazy()

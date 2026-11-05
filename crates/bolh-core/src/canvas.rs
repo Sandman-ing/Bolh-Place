@@ -304,9 +304,13 @@ impl Editor {
 
     /// Убирает последнюю точку отмены, если после неё ничего не поменялось
     /// (щёлкнули по карточке, но не сдвинули).
-    pub fn drop_empty_checkpoint(&mut self) {
+    /// `true`, если точка оказалась пустой и убрана.
+    pub fn drop_empty_checkpoint(&mut self) -> bool {
         if self.undo.last() == Some(&self.canvas.nodes) {
             self.undo.pop();
+            true
+        } else {
+            false
         }
     }
 
@@ -652,7 +656,11 @@ mod tests {
         let mut e = ed();
         e.add_card(p(0.0, 0.0), None);
         e.checkpoint();
-        e.drop_empty_checkpoint();
+        assert!(e.drop_empty_checkpoint());
+        e.checkpoint();
+        e.move_selection(1.0, 0.0);
+        assert!(!e.drop_empty_checkpoint(), "сдвинули — точка нужна");
+        assert!(e.undo());
         assert!(e.undo());
         assert!(e.nodes().is_empty());
     }

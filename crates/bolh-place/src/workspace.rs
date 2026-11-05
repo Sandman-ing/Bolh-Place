@@ -32,6 +32,7 @@ use gpui_kit::{
 use crate::actions::{
     self, CloseTab, NewCanvas, NewDocument, NewFolder, NextTab, OpenPalette, PrevTab, Save,
 };
+use crate::canvas_view::{CanvasEvent, CanvasView};
 use crate::i18n::{error_text, set_language, tr, trf};
 use crate::palette::{self, Command as PaletteCommand};
 use crate::{paths, theme, updater};
@@ -47,6 +48,8 @@ pub struct OpenTab {
     pub file: OpenFile,
     /// Поле заглушки редактора — только у документов.
     editor: Option<Entity<TextareaState>>,
+    /// Холст — только у холстов.
+    canvas: Option<Entity<CanvasView>>,
     /// О чужой правке уже сказали — не повторять каждые две секунды.
     external_noticed: bool,
     /// Отложенное автосохранение. У каждой вкладки своё: правка в одной
@@ -56,6 +59,10 @@ pub struct OpenTab {
 }
 
 impl OpenTab {
+    pub fn canvas_view(&self) -> Option<&Entity<CanvasView>> {
+        self.canvas.as_ref()
+    }
+
     pub fn title(&self) -> String {
         self.file
             .rel
@@ -546,10 +553,29 @@ impl Workspace {
             }
             Content::Canvas(_) => None,
         };
+        let canvas = match &file.content {
+            Content::Canvas(c) => {
+                let (c, read_only) = (c.clone(), !file.content.is_writable());
+                let view = cx.new(|cx| CanvasView::new(c, read_only, cx));
+                subscriptions.push(cx.subscribe_in(
+                    &view,
+                    window,
+                    move |this, view, ev, window, cx| match ev {
+                        CanvasEvent::Changed => {
+                            let canvas = view.read(cx).canvas().clone();
+                            this.on_canvas_edited(id, canvas, window, cx);
+                        }
+                    },
+                ));
+                Some(view)
+            }
+            Content::Document(_) => None,
+        };
         self.tabs.push(OpenTab {
             id,
             file,
             editor,
+            canvas,
             external_noticed: false,
             autosave: None,
             _subscriptions: subscriptions,
@@ -565,9 +591,11 @@ impl Workspace {
         self.active = Some(ix);
         // Фокус — в поле документа, а у холста — на само окно: иначе
         // фокус остался бы на закрытой вкладке, и клавиши бы не работали.
-        match &self.tabs[ix].editor {
-            Some(editor) => editor.focus_handle(cx).focus(window, cx),
-            None => self.focus_handle.focus(window, cx),
+        let tab = &self.tabs[ix];
+        match (&tab.editor, &tab.canvas) {
+            (Some(editor), _) => editor.focus_handle(cx).focus(window, cx),
+            (_, Some(canvas)) => canvas.focus_handle(cx).focus(window, cx),
+            _ => self.focus_handle.focus(window, cx),
         }
         cx.notify();
     }
@@ -590,10 +618,46 @@ impl Workspace {
         }
         doc.set_plain_text(text);
         cx.notify();
+        Self::schedule_autosave(tab, window, cx);
+    }
+
+    fn on_canvas_edited(
+        &mut self,
+        id: u64,
+        canvas: bolh_core::format::Canvas,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        tab.file.content = Content::Canvas(canvas);
+        cx.notify();
+        Self::schedule_autosave(tab, window, cx);
+    }
+
+    fn schedule_autosave(tab: &mut OpenTab, window: &mut Window, cx: &mut Context<Self>) {
+        let id = tab.id;
         tab.autosave = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(AUTOSAVE_DELAY).await;
             let _ = this.update_in(cx, |this, window, cx| this.save_tab(id, window, cx));
         }));
+    }
+
+    /// Показывает в поле документа или на холсте то, что сейчас в файле
+    /// вкладки, — после правки из облака или отката к снимку.
+    fn show_file_content(tab: &OpenTab, window: &mut Window, cx: &mut Context<Self>) {
+        match (&tab.file.content, &tab.editor, &tab.canvas) {
+            (Content::Document(doc), Some(editor), _) => {
+                let text = doc.plain_text();
+                editor.update(cx, |s, cx| s.set_value(text, window, cx));
+            }
+            (Content::Canvas(c), _, Some(view)) => {
+                let c = c.clone();
+                view.update(cx, |v, cx| v.replace_canvas(c, cx));
+            }
+            _ => {}
+        }
     }
 
     /// Сохраняет вкладку через ядро. Ядро само решает, не было ли чужой
@@ -680,12 +744,7 @@ impl Workspace {
                         }
                     } else {
                         space.accept_external(&mut tab.file, *content, bytes);
-                        if let (Some(editor), Content::Document(doc)) =
-                            (&tab.editor, &tab.file.content)
-                        {
-                            let text = doc.plain_text();
-                            editor.update(cx, |s, cx| s.set_value(text, window, cx));
-                        }
+                        Self::show_file_content(tab, window, cx);
                         notes.push((
                             NotificationType::Info,
                             trf(cx, "sync.changed", &[("name", &name)]),
@@ -988,10 +1047,7 @@ impl Workspace {
         let label = crate::i18n::current(cx).t("names.conflict").to_string();
         match space.restore_snapshot(&mut tab.file, snap, &label, Self::clock()) {
             Ok(_) => {
-                if let (Some(editor), Content::Document(doc)) = (&tab.editor, &tab.file.content) {
-                    let text = doc.plain_text();
-                    editor.update(cx, |s, cx| s.set_value(text, window, cx));
-                }
+                Self::show_file_content(tab, window, cx);
                 let text = trf(cx, "history.restored", &[("time", when)]);
                 self.notify(NotificationType::Success, text, false, window, cx);
                 self.refresh_tree(cx);
@@ -1536,6 +1592,14 @@ impl Workspace {
                 .text_color(cx.theme().muted_foreground)
                 .child(tr(cx, key))
         };
+        // Холст занимает всё место, без полей документа.
+        if let Some(canvas) = &tab.canvas {
+            return div()
+                .id("content")
+                .size_full()
+                .child(canvas.clone())
+                .into_any_element();
+        }
         let body = match (&tab.file.content, &tab.editor) {
             (Content::Document(_), Some(editor)) => v_flex()
                 .size_full()
@@ -1554,28 +1618,6 @@ impl Workspace {
                         .bordered(false)
                         .readonly(!writable)
                         .aria_label(tab.title()),
-                )
-                .into_any_element(),
-            (Content::Canvas(c), _) => v_flex()
-                .size_full()
-                .gap_3()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(IconName::Shapes)
-                        .size(px(40.))
-                        .text_color(theme.muted_foreground),
-                )
-                .child(stub_note("canvas.stub", cx))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(trf(
-                            cx,
-                            "canvas.objects",
-                            &[("count", &c.nodes.len().to_string())],
-                        )),
                 )
                 .into_any_element(),
             _ => div().into_any_element(),

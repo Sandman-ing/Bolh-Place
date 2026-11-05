@@ -4,7 +4,8 @@
 //! рисование. Изменения уходят наружу событием [`CanvasEvent::Changed`]:
 //! вкладка кладёт их в файл и сохраняет через ядро.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use bolh_core::canvas::{self, Editor, Guide, Point, Rect, View};
@@ -113,6 +114,9 @@ enum Gesture {
     None,
     /// Тащим выделенное. `applied` — сколько уже сдвинули с начала.
     Move {
+        /// Карточка под мышью и была ли нажата клавиша добавления.
+        pressed: String,
+        add: bool,
         start: Point,
         start_bounds: Rect,
         applied: (f64, f64),
@@ -150,6 +154,9 @@ pub struct CanvasView {
     /// Поставить фокус в поле текста при следующей отрисовке. Сразу нельзя:
     /// щелчок по холсту после нашего обработчика забирает фокус себе.
     focus_editing: bool,
+    /// Высота карточек после раскладки, в точках холста: длинный текст
+    /// делает карточку выше заданной.
+    measured: Rc<RefCell<HashMap<String, f64>>>,
     /// Где на экране поле: нужно, чтобы перевести точку окна в точку холста.
     bounds: Rc<Cell<Bounds<Pixels>>>,
     focus_handle: FocusHandle,
@@ -180,9 +187,42 @@ impl CanvasView {
             editing: None,
             read_only,
             focus_editing: false,
+            measured: Rc::new(RefCell::new(HashMap::new())),
             bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Высота, которую карточка заняла на экране в прошлый раз.
+    fn shown_height(&self, id: &str) -> f64 {
+        self.measured.borrow().get(id).copied().unwrap_or(0.0)
+    }
+
+    /// Карточки, которые текст сделал выше заданного, получают эту высоту
+    /// в файле: иначе выделение, уголки и прилипание считались бы по
+    /// старой высоте. Только рост: размер, заданный руками, не уменьшается.
+    fn apply_measured_heights(&mut self, cx: &mut Context<Self>) {
+        let grown: Vec<(String, f64)> = self
+            .measured
+            .borrow()
+            .iter()
+            .filter_map(|(id, h)| {
+                let n = self.editor.node(id)?;
+                (*h > n.height + 0.5).then(|| (id.clone(), h.round()))
+            })
+            .collect();
+        if grown.is_empty() {
+            return;
+        }
+        for (id, h) in grown {
+            if let Some(n) = self.editor.node(&id) {
+                let r = Rect { h, ..Rect::of(n) };
+                self.editor.set_rect(&id, r);
+            }
+        }
+        // Без отдельного шага отмены: рост — следствие текста, и отмена
+        // текста вернёт и высоту.
+        cx.emit(CanvasEvent::Changed);
     }
 
     pub fn editor(&self) -> &Editor {
@@ -258,9 +298,19 @@ impl CanvasView {
     // ---- Мышь -----------------------------------------------------------
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_handle.focus(window, cx);
         let local = self.local(ev.position);
         let world = self.view.to_world(local);
+        // Щелчок внутри карточки, текст которой правится, — это поле ввода:
+        // курсор в нужное место, выделение текста. Правку не прерываем.
+        if let Some((id, ..)) = &self.editing
+            && self.editor.hit(world) == Some(id.as_str())
+        {
+            // Щелчок ниже текста холст забрал бы фокус себе — вернём его полю.
+            self.focus_editing = true;
+            cx.notify();
+            return;
+        }
+        self.focus_handle.focus(window, cx);
         if ev.button == MouseButton::Middle || (ev.button == MouseButton::Left && self.space_held) {
             self.gesture = Gesture::Pan { last: local };
             return;
@@ -268,7 +318,7 @@ impl CanvasView {
         if ev.button != MouseButton::Left {
             return;
         }
-        self.finish_editing(cx);
+        self.finish_editing(window, cx);
         if self.read_only {
             return;
         }
@@ -300,6 +350,8 @@ impl CanvasView {
                 {
                     self.editor.checkpoint();
                     self.gesture = Gesture::Move {
+                        pressed: id.clone(),
+                        add,
                         start: world,
                         start_bounds: b,
                         applied: (0.0, 0.0),
@@ -341,6 +393,7 @@ impl CanvasView {
                 start,
                 start_bounds,
                 applied,
+                ..
             } => {
                 let raw = (world.x - start.x, world.y - start.y);
                 let moved = Rect {
@@ -418,10 +471,19 @@ impl CanvasView {
         let gesture = std::mem::replace(&mut self.gesture, Gesture::None);
         self.guides.clear();
         match gesture {
-            Gesture::Move { .. } | Gesture::Resize { .. } => {
-                let before = self.editor.can_undo();
-                self.editor.drop_empty_checkpoint();
-                if before && self.editor.can_undo() {
+            Gesture::Move { pressed, add, .. } => {
+                if self.editor.drop_empty_checkpoint() {
+                    // Щёлкнули, не сдвинув, по одной из выделенных карточек —
+                    // выделенной остаётся только она, как в проводнике.
+                    if !add {
+                        self.editor.select_only(&pressed);
+                    }
+                } else {
+                    self.changed(cx);
+                }
+            }
+            Gesture::Resize { .. } => {
+                if !self.editor.drop_empty_checkpoint() {
                     self.changed(cx);
                 }
             }
@@ -487,7 +549,7 @@ impl CanvasView {
         };
         let text = node.text.clone();
         let state = cx.new(|cx| {
-            let mut s = TextareaState::new(window, cx);
+            let mut s = TextareaState::new(window, cx).auto_grow(1, 400);
             s.set_value(text, window, cx);
             s
         });
@@ -505,8 +567,11 @@ impl CanvasView {
         cx.notify();
     }
 
-    fn finish_editing(&mut self, cx: &mut Context<Self>) {
+    /// Заканчивает правку текста. Фокус возвращается холсту: иначе он
+    /// остался бы на исчезнувшем поле, и клавиши холста перестали бы работать.
+    fn finish_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.take().is_some() {
+            self.focus_handle.focus(window, cx);
             // Ничего не набрали — точка отмены не нужна.
             self.editor.drop_empty_checkpoint();
             cx.notify();
@@ -688,6 +753,7 @@ impl Render for CanvasView {
                 self.zoom_fit(cx);
             }
         }
+        self.apply_measured_heights(cx);
         if self.focus_editing {
             self.focus_editing = false;
             if let Some((_, state, _)) = &self.editing {
@@ -756,28 +822,67 @@ impl Render for CanvasView {
                     .left(px(s.x as f32))
                     .top(px(s.y as f32))
                     .w(px((n.width * zoom) as f32))
-                    .h(px((n.height * zoom) as f32))
+                    // Высота — не меньше заданной, а длинный текст растит
+                    // карточку: её меряем после раскладки и запоминаем.
+                    .min_h(px((n.height * zoom) as f32))
                     .rounded(px((16.0 * zoom) as f32))
                     .bg(theme.popover)
-                    .border_color(if selected { theme.primary } else { theme.input })
-                    .when(selected, |d| d.border_2())
-                    .when(!selected, |d| d.border_1())
-                    .overflow_hidden()
+                    // Рамка одной толщины всегда: выделение рисуется отдельным
+                    // контуром снаружи, и текст не сдвигается.
+                    .border_1()
+                    .border_color(theme.input)
                     .p(px((12.0 * zoom) as f32))
                     .text_size(px(text_px))
                     .line_height(px(text_px * 1.375))
                     .text_color(theme.foreground);
                 if editing && let Some((_, state, _)) = &self.editing {
+                    // Тот же шрифт, что и без правки, — текст не прыгает.
                     card = card.child(
                         Textarea::new(state)
-                            .h_full()
                             .bordered(false)
-                            .appearance(false),
+                            .appearance(false)
+                            // Без своего фона поле не рисуется вовсе — текст
+                            // при наборе было не видно.
+                            .bg(theme.popover)
+                            .text_color(theme.foreground)
+                            // Самый маленький размер поля — с минимальными
+                            // внутренними отступами (4 слева и справа), их и
+                            // гасим, чтобы текст стоял там же, где без правки.
+                            .xsmall()
+                            .mx(px(-4.))
+                            .p_0()
+                            .text_size(px(text_px))
+                            .line_height(px(text_px * 1.375)),
                     );
                 } else if text_px >= 4.0 {
                     card = card.child(n.text.clone());
                 }
-                card
+                let measured = self.measured.clone();
+                let id = n.id.clone();
+                card = card.child(
+                    paint_canvas(
+                        move |b, _, _| {
+                            measured.borrow_mut().insert(id, f(b.size.height) / zoom);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                );
+                let ring = selected.then(|| {
+                    div()
+                        .absolute()
+                        .left(px((s.x - 2.0) as f32))
+                        .top(px((s.y - 2.0) as f32))
+                        .w(px((n.width * zoom + 4.0) as f32))
+                        .h(px(
+                            (n.height.max(self.shown_height(&n.id)) * zoom + 4.0) as f32
+                        ))
+                        .rounded(px((16.0 * zoom + 2.0) as f32))
+                        .border_2()
+                        .border_color(theme.primary)
+                });
+                div().child(card).children(ring)
             })
             .collect::<Vec<_>>();
 
@@ -794,8 +899,13 @@ impl Render for CanvasView {
                 });
                 [(a.x, a.y), (b.x, a.y), (b.x, b.y), (a.x, b.y)]
                     .into_iter()
-                    .map(|(x, y)| {
+                    .enumerate()
+                    .map(|(i, (x, y))| {
                         div()
+                            .id(("handle", i))
+                            // Курсор подсказывает, что за уголок можно тянуть.
+                            .when(i % 2 == 0, |d| d.cursor_nwse_resize())
+                            .when(i % 2 == 1, |d| d.cursor_nesw_resize())
                             .absolute()
                             .left(px((x - 5.0) as f32))
                             .top(px((y - 5.0) as f32))
@@ -914,9 +1024,9 @@ impl Render for CanvasView {
                 this.editor.select_all();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &Deselect, _, cx| {
+            .on_action(cx.listener(|this, _: &Deselect, window, cx| {
                 if this.editing.is_some() {
-                    this.finish_editing(cx);
+                    this.finish_editing(window, cx);
                 } else {
                     this.editor.clear_selection();
                     cx.notify();

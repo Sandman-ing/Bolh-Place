@@ -303,3 +303,67 @@ fn reopened_canvas_has_the_same_cards(cx: &mut TestAppContext) {
     });
     assert_eq!(nodes_in_view(cx, &fx), saved);
 }
+
+fn editing(cx: &mut TestAppContext, fx: &Fx) -> bool {
+    cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        let v = ws.active_tab().unwrap().canvas_view().unwrap().read(cx);
+        v.is_editing()
+    })
+}
+
+#[gpui_kit::test]
+fn click_inside_edited_card_keeps_editing(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    act(cx, &fx, |w, cx| w.input("раз", cx));
+    act(cx, &fx, |w, cx| w.click("node:a", cx));
+    assert!(
+        editing(cx, &fx),
+        "щелчок внутри карточки не прерывает правку"
+    );
+    act(cx, &fx, |w, cx| w.input("два", cx));
+    assert!(nodes_in_view(cx, &fx)[0].text.contains("два"));
+}
+
+#[gpui_kit::test]
+fn after_escape_canvas_keys_work_again(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    act(cx, &fx, |w, cx| w.input("т", cx));
+    act(cx, &fx, |w, cx| w.press("escape", cx));
+    assert!(!editing(cx, &fx));
+    act(cx, &fx, |w, cx| w.press("right", cx));
+    assert_eq!(
+        nodes_in_view(cx, &fx)[0].x,
+        1.0,
+        "стрелка двигает карточку после Esc"
+    );
+}
+
+#[gpui_kit::test]
+fn plain_click_on_one_of_selected_keeps_only_it(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0), card("b", 400.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.press("ctrl-a", cx));
+    act(cx, &fx, |w, cx| w.click("node:b", cx));
+    let sel = cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        let v = ws.active_tab().unwrap().canvas_view().unwrap().read(cx);
+        v.editor().selection().to_vec()
+    });
+    assert_eq!(sel, ["b"]);
+}
+
+#[gpui_kit::test]
+fn long_text_makes_card_taller(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    let long = "очень длинная строка текста ".repeat(12);
+    act(cx, &fx, |w, cx| w.input(&long, cx));
+    act(cx, &fx, |w, cx| w.press("escape", cx));
+    act(cx, &fx, |_, _| {});
+    let h = nodes_in_view(cx, &fx)[0].height;
+    assert!(h > 140.0, "карточка выросла под текст: {h}");
+    save_now(cx, &fx);
+    assert_eq!(nodes_on_disk(&fx)[0].height, h, "высота сохранена");
+}

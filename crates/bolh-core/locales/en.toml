@@ -53,8 +53,18 @@ placeholder = "Start writing…"
 read_only = "This file was made by a newer Bolh Place and is open read-only."
 
 [canvas]
-stub = "The canvas arrives in stage 2."
-objects = "Objects on canvas: {count}"
+add_card = "New card (double-click the canvas)"
+grid = "Grid and snapping"
+zoom_in = "Zoom in (Ctrl +)"
+zoom_out = "Zoom out (Ctrl −)"
+zoom_reset = "Zoom to 100% (Ctrl+0)"
+zoom_fit = "Show everything (Shift+1)"
+hint = "Double-click the canvas for a new card. Wheel zooms, Space or middle button pans."
+bring_to_front = "Bring to front"
+bring_forward = "Bring forward"
+send_backward = "Send backward"
+send_to_back = "Send to back"
+duplicate = "Duplicate"
 
 [sync]
 changed = "“{name}” was changed on another computer. Showing the new version."

@@ -13,10 +13,12 @@ gpui_kit::assets::icon_assets!(
         FilePlus,
         FolderInput,
         FolderPlus,
+        Grid3x3,
         Languages,
         Monitor,
         RotateCcw,
         Shapes,
+        SquarePlus,
         Trash,
         X
     ]

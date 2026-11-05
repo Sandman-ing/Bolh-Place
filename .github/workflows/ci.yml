@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows:
+    name: Windows — сборка и снимок окна
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Сборка
+        run: cargo build --locked --release -p bolh-place
+      - name: Снимок окна
+        shell: pwsh
+        run: ./scripts/screenshot.ps1 -Exe target/release/bolh-place.exe -Out window.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot
+          path: window.png
+          if-no-files-found: warn

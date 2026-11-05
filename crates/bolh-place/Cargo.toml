@@ -1,0 +1,9 @@
+[package]
+name = "bolh-place"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+bolh-core = { path = "../bolh-core" }

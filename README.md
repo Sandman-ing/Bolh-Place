@@ -6,6 +6,7 @@
 
 - Что именно делаем — [BOLH_PLACE_SPEC.md](BOLH_PLACE_SPEC.md).
 - Как работаем — [CLAUDE.md](CLAUDE.md).
+- Как выглядит — [docs/design-tokens.md](docs/design-tokens.md).
 
 Rust, интерфейс на GPUI. Windows 10 и 11.
 

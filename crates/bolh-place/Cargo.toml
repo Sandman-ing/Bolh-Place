@@ -1,9 +1,30 @@
 [package]
 name = "bolh-place"
+description = "Bolh Place — документы и холсты для планов"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bolh-place"
+path = "src/main.rs"
 
 [dependencies]
-gpui-kit.workspace = true
 bolh-core = { path = "../bolh-core" }
+gpui-kit.workspace = true
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+dirs = "6.0.0"
+semver = "1.0.28"
+serde_json = "1.0.154"
+sys-locale = "0.3.2"
+# HTTPS через системный TLS Windows (SChannel): без лишних библиотек и
+# со своими сертификатами системы.
+ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile = "3.27.0"

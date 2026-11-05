@@ -1,0 +1,84 @@
+name: CI
+
+# На каждую правку: формат, clippy без предупреждений, тесты в Linux и
+# Windows, сборка установщика и его проверка на чистом Windows.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux:
+    name: Linux — формат, clippy, тесты, лицензии
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Системные библиотеки для GPUI
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libssl-dev
+      - name: Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Формат
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Тесты
+        run: cargo test --workspace --locked
+      - name: Лицензии библиотек
+        run: python3 scripts/check-licenses.py
+
+  windows-tests:
+    name: Windows — clippy и тесты
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Тесты
+        run: cargo test --workspace --locked
+
+  windows-installer:
+    name: Windows — установщик и проверка руками робота
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Сборка
+        run: cargo build --release --locked -p bolh-place
+      - name: Установщик
+        id: installer
+        shell: pwsh
+        run: ./scripts/build-installer.ps1
+      - name: Установить, запустить, обновить, удалить
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./scripts/smoke-installer.ps1 -Installer "${{ steps.installer.outputs.installer }}"
+      - name: Снимки экрана
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screens/
+          if-no-files-found: warn
+      - name: Установщик для ручной проверки
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: dist/*.exe

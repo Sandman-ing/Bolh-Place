@@ -1,0 +1,132 @@
+# English UI strings. Keys must match ru.toml — a test checks this.
+# {name} is a placeholder and must be kept as is.
+
+[language]
+name = "English"
+
+[app]
+title = "Bolh Place"
+
+[common]
+ok = "Done"
+cancel = "Cancel"
+create = "Create"
+rename = "Rename"
+delete = "Delete"
+close = "Close"
+name = "Name"
+
+[names]
+document = "Untitled"
+canvas = "New canvas"
+folder = "New folder"
+conflict = "conflict"
+
+[space]
+title = "Spaces"
+new = "New space"
+open = "Open folder as space"
+forget = "Remove from list"
+none_title = "No spaces yet"
+none_body = "A space is a regular folder on disk. Create a new one or pick a folder, for example in OneDrive, to sync files between computers."
+choose_parent = "Where to create the space"
+choose_folder = "Choose a folder"
+default_name = "My space"
+missing = "The folder of space “{name}” was not found. The drive may be disconnected or the folder moved."
+
+[tree]
+title = "Files"
+new_document = "New document"
+new_canvas = "New canvas"
+new_folder = "New folder"
+empty = "Nothing here yet. Create a document or a canvas."
+rename_title = "New name"
+
+[tabs]
+unsaved = "Unsaved changes"
+empty_title = "Nothing is open"
+empty_body = "Pick a file on the left or press Ctrl+P."
+
+[document]
+stub = "The document editor arrives in stage 3. For now this is plain text: each line is a paragraph."
+placeholder = "Start writing…"
+read_only = "This file was made by a newer Bolh Place and is open read-only."
+
+[canvas]
+stub = "The canvas arrives in stage 2."
+objects = "Objects on canvas: {count}"
+
+[sync]
+changed = "“{name}” was changed on another computer. Showing the new version."
+changed_dirty = "“{name}” was changed on another computer while you were editing. Saving will keep both versions."
+conflict = "“{name}” was edited here and on another computer at the same time. Both versions are kept: theirs in place, yours in “{copy}”."
+deleted = "“{name}” was deleted on another computer. Keep editing to bring it back."
+unreadable = "“{name}” can’t be read right now — the cloud may still be downloading it."
+saved = "Saved"
+
+[history]
+title = "Version history"
+empty = "No snapshots yet."
+restore = "Restore this version"
+restored = "Version from {time} restored. The previous one stays in history."
+
+[trash]
+title = "Trash"
+empty = "Trash is empty."
+restore = "Restore"
+purge = "Delete forever"
+deleted = "“{name}” moved to trash."
+restored = "“{name}” restored."
+
+[theme]
+title = "Theme"
+dark = "Dark"
+light = "Light"
+system = "Same as Windows"
+
+[settings]
+language = "Language"
+
+[palette]
+placeholder = "Command or file…"
+empty = "Nothing found"
+files = "Files"
+commands = "Commands"
+
+[command]
+new_document = "New document"
+new_canvas = "New canvas"
+new_folder = "New folder"
+new_space = "New space"
+open_space = "Open folder as space"
+switch_space = "Switch to space “{name}”"
+save = "Save"
+close_tab = "Close tab"
+history = "Version history"
+trash = "Open trash"
+theme_dark = "Theme: dark"
+theme_light = "Theme: light"
+theme_system = "Theme: same as Windows"
+language = "Language: {name}"
+check_update = "Check for updates"
+
+[update]
+available = "Version {version} is available."
+install = "Update"
+later = "Later"
+downloading = "Downloading the update…"
+up_to_date = "You have the latest version."
+failed = "Update failed: {reason}"
+bad_signature = "The update failed the signature check and will not be installed."
+offline = "Can’t reach GitHub. Try again later."
+
+[error]
+io = "Could not read or write “{path}”."
+corrupt = "“{path}” is damaged and can’t be opened."
+too_new = "“{path}” was made by a newer Bolh Place. Please update."
+not_a_space = "“{path}” is not a space."
+outside = "This path leads outside the space."
+exists = "“{path}” already exists."
+not_found = "“{path}” was not found."
+invalid_name = "This name can’t be used: “{path}”."
+update = "Update error."

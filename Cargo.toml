@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/bolh-core", "crates/bolh-place", "crates/bolh-sign"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[workspace.dependencies]
+# Интерфейс: версия закреплена точно, обновляется осознанно (раздел 2 спецификации).
+gpui-kit = "=0.9.0"

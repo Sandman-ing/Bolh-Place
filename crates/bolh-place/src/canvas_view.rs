@@ -13,7 +13,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, h_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, MouseButton,
@@ -26,6 +28,9 @@ use gpui_kit::{
 use crate::i18n::tr;
 
 pub const CONTEXT: &str = "Canvas";
+/// Клавиши холста — только пока в карточке не печатают: буквы и знаки
+/// должны попасть в текст, а не включить инструмент или показать всё.
+const IDLE: &str = "Canvas && !editing";
 
 /// Насколько близко к соседу объект прилипает, в точках экрана.
 const SNAP_SCREEN_PX: f64 = 6.0;
@@ -77,11 +82,14 @@ gpui_kit::actions!(
         MoveRightGrid,
         MoveUpGrid,
         MoveDownGrid,
+        ToolSelect,
+        ToolHand,
+        ToolCard,
     ]
 );
 
 pub fn bind_keys(cx: &mut App) {
-    let c = Some(CONTEXT);
+    let c = Some(IDLE);
     cx.bind_keys([
         KeyBinding::new("ctrl-z", Undo, c),
         KeyBinding::new("ctrl-y", Redo, c),
@@ -93,7 +101,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", Paste, c),
         KeyBinding::new("ctrl-d", Duplicate, c),
         KeyBinding::new("ctrl-a", SelectAll, c),
-        KeyBinding::new("escape", Deselect, c),
+        // Esc работает и во время правки текста: им правку и заканчивают.
+        KeyBinding::new("escape", Deselect, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-]", BringToFront, c),
         KeyBinding::new("ctrl-shift-[", SendToBack, c),
         KeyBinding::new("ctrl-]", BringForward, c),
@@ -113,7 +122,24 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-right", MoveRightGrid, c),
         KeyBinding::new("shift-up", MoveUpGrid, c),
         KeyBinding::new("shift-down", MoveDownGrid, c),
+        // Инструменты. Windows сверяет клавишу по месту на клавиатуре, так
+        // что и в русской раскладке это те же кнопки.
+        KeyBinding::new("v", ToolSelect, c),
+        KeyBinding::new("h", ToolHand, c),
+        KeyBinding::new("c", ToolCard, c),
     ]);
+}
+
+/// Что делает левая кнопка мыши на поле.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tool {
+    /// Выделять, двигать, менять размер.
+    #[default]
+    Select,
+    /// Двигать само поле.
+    Hand,
+    /// Поставить карточку щелчком. Поставили — снова выделение.
+    Card,
 }
 
 pub enum CanvasEvent {
@@ -161,6 +187,7 @@ pub struct CanvasView {
     gesture: Gesture,
     guides: Vec<Guide>,
     space_held: bool,
+    tool: Tool,
     /// Карточка, текст которой сейчас правится, и поле для правки.
     editing: Option<(String, gpui_kit::Entity<TextareaState>, Subscription)>,
     read_only: bool,
@@ -198,6 +225,7 @@ impl CanvasView {
             gesture: Gesture::None,
             guides: Vec::new(),
             space_held: false,
+            tool: Tool::Select,
             editing: None,
             read_only,
             focus_editing: false,
@@ -222,6 +250,18 @@ impl CanvasView {
 
     pub fn is_editing(&self) -> bool {
         self.editing.is_some()
+    }
+
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        if tool == Tool::Card && self.read_only {
+            return;
+        }
+        self.tool = tool;
+        cx.notify();
     }
 
     /// После расхождения холст живёт копией со своим id.
@@ -299,8 +339,10 @@ impl CanvasView {
             return;
         }
         self.focus_handle.focus(window, cx);
-        if ev.button == MouseButton::Middle || (ev.button == MouseButton::Left && self.space_held) {
+        let hand = self.space_held || self.tool == Tool::Hand;
+        if ev.button == MouseButton::Middle || (ev.button == MouseButton::Left && hand) {
             self.gesture = Gesture::Pan { last: local };
+            cx.notify();
             return;
         }
         if ev.button != MouseButton::Left {
@@ -308,6 +350,13 @@ impl CanvasView {
         }
         self.finish_editing(window, cx);
         if self.read_only {
+            return;
+        }
+        if self.tool == Tool::Card {
+            let id = self.editor.add_card(world, self.grid_step());
+            self.tool = Tool::Select;
+            self.changed(cx);
+            self.start_editing(&id, window, cx);
             return;
         }
         if let Some((id, corner, original)) = self.handle_at(local) {
@@ -604,6 +653,13 @@ impl CanvasView {
         }
     }
 
+    /// Отмена или повтор с кнопки. Если в карточке печатали, правка текста
+    /// сначала заканчивается и отменяется целиком, как с клавиш после Esc.
+    fn undo_redo(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_editing(window, cx);
+        self.edit(cx, if redo { Editor::redo } else { Editor::undo });
+    }
+
     fn nudge(&mut self, dx: f64, dy: f64, shift: bool, cx: &mut Context<Self>) {
         let step = if shift { canvas::GRID } else { 1.0 };
         self.edit(cx, |e| {
@@ -614,20 +670,6 @@ impl CanvasView {
             e.move_selection(dx * step, dy * step);
             true
         });
-    }
-
-    pub fn add_card_at_center(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
-            return;
-        }
-        let (w, h) = self.size();
-        let at = self.view.to_world(Point {
-            x: w / 2.0,
-            y: h / 2.0,
-        });
-        let id = self.editor.add_card(at, self.grid_step());
-        self.changed(cx);
-        self.start_editing(&id, window, cx);
     }
 
     fn zoom_center(&mut self, factor: f64, cx: &mut Context<Self>) {
@@ -676,6 +718,64 @@ impl CanvasView {
 
     // ---- Отрисовка ------------------------------------------------------
 
+    /// Панель инструментов слева: чем работает левая кнопка мыши.
+    fn render_tools(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let mut tools = vec![
+            (
+                Tool::Select,
+                "canvas-tool-select",
+                IconName::MousePointer2,
+                "canvas.tool_select",
+            ),
+            (
+                Tool::Hand,
+                "canvas-tool-hand",
+                IconName::Hand,
+                "canvas.tool_hand",
+            ),
+        ];
+        if !self.read_only {
+            tools.push((
+                Tool::Card,
+                "canvas-tool-card",
+                IconName::StickyNote,
+                "canvas.tool_card",
+            ));
+        }
+        let panel = v_flex()
+            .id("canvas-tools")
+            .gap_1()
+            .p_1()
+            .rounded(px(14.))
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().input)
+            // Щелчок по панели — не щелчок по полю: иначе снималось бы
+            // выделение, а «Карточка» ставила бы карточку под кнопкой.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(tools.into_iter().map(|(tool, id, icon, tip)| {
+                Button::new(id)
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(icon))
+                    .selected(self.tool == tool)
+                    .tooltip(tr(cx, tip))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tool(tool, cx)))
+            }));
+        // Столбец во всю высоту только ставит панель посередине; сам он мышь
+        // не ловит.
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(16.))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(panel)
+            .into_any_element()
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let zoom = SharedString::from(format!("{:.0}%", self.view.zoom * 100.0));
         h_flex()
@@ -689,15 +789,28 @@ impl CanvasView {
             .bg(cx.theme().popover)
             .border_1()
             .border_color(cx.theme().input)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when(!self.read_only, |d| {
                 d.child(
-                    Button::new("canvas-add-card")
+                    Button::new("canvas-undo")
                         .ghost()
                         .small()
-                        .icon(Icon::new(IconName::SquarePlus))
-                        .tooltip(tr(cx, "canvas.add_card"))
+                        .icon(Icon::new(IconName::Undo2))
+                        .disabled(!self.editor.can_undo())
+                        .tooltip(tr(cx, "canvas.undo"))
                         .on_click(
-                            cx.listener(|this, _, window, cx| this.add_card_at_center(window, cx)),
+                            cx.listener(|this, _, window, cx| this.undo_redo(false, window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("canvas-redo")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(IconName::Redo2))
+                        .disabled(!self.editor.can_redo())
+                        .tooltip(tr(cx, "canvas.redo"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.undo_redo(true, window, cx)),
                         ),
                 )
             })
@@ -1066,7 +1179,16 @@ impl Render for CanvasView {
             })
             .collect::<Vec<_>>();
 
-        let hint = (self.editor.nodes().is_empty() && !self.read_only).then(|| {
+        // Подсказка сверху: что делать с выбранной «Карточкой» или как
+        // начать на пустом холсте.
+        let hint_key = if self.tool == Tool::Card {
+            Some("canvas.place_card")
+        } else if self.editor.nodes().is_empty() && !self.read_only {
+            Some("canvas.hint")
+        } else {
+            None
+        };
+        let hint = hint_key.map(|key| {
             div()
                 .absolute()
                 .top(px(24.))
@@ -1081,22 +1203,32 @@ impl Render for CanvasView {
                         .bg(theme.muted)
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child(tr(cx, "canvas.hint")),
+                        .child(tr(cx, key)),
                 )
         });
 
         let toolbar = self.render_toolbar(cx);
+        let tools = self.render_tools(cx);
         let has_selection = !self.editor.selection().is_empty();
+        let panning = matches!(self.gesture, Gesture::Pan { .. });
+        let hand = self.space_held || self.tool == Tool::Hand;
         div()
             .id("canvas")
             .test_support()
-            .key_context(CONTEXT)
+            // Пока в карточке печатают, клавиши холста молчат (см. IDLE).
+            .key_context(if self.editing.is_some() {
+                "Canvas editing"
+            } else {
+                CONTEXT
+            })
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .overflow_hidden()
             .bg(theme.background)
-            .when(self.space_held, |d| d.cursor_grab())
+            .when(panning, |d| d.cursor_grabbing())
+            .when(hand && !panning, |d| d.cursor_grab())
+            .when(self.tool == Tool::Card, |d| d.cursor_crosshair())
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1129,6 +1261,8 @@ impl Render for CanvasView {
             .on_action(cx.listener(|this, _: &Deselect, window, cx| {
                 if this.editing.is_some() {
                     this.finish_editing(window, cx);
+                } else if this.tool != Tool::Select {
+                    this.set_tool(Tool::Select, cx);
                 } else {
                     this.editor.clear_selection();
                     cx.notify();
@@ -1167,6 +1301,9 @@ impl Render for CanvasView {
             .on_action(cx.listener(|this, _: &MoveUpGrid, _, cx| this.nudge(0.0, -1.0, true, cx)))
             .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.nudge(0.0, 1.0, false, cx)))
             .on_action(cx.listener(|this, _: &MoveDownGrid, _, cx| this.nudge(0.0, 1.0, true, cx)))
+            .on_action(cx.listener(|this, _: &ToolSelect, _, cx| this.set_tool(Tool::Select, cx)))
+            .on_action(cx.listener(|this, _: &ToolHand, _, cx| this.set_tool(Tool::Hand, cx)))
+            .on_action(cx.listener(|this, _: &ToolCard, _, cx| this.set_tool(Tool::Card, cx)))
             .context_menu(move |menu, window, cx| {
                 let _ = window;
                 if !has_selection {
@@ -1198,6 +1335,7 @@ impl Render for CanvasView {
             .children(guides)
             .children(marquee)
             .children(hint)
+            .child(tools)
             .child(toolbar)
     }
 }

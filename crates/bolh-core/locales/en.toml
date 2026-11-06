@@ -53,7 +53,12 @@ placeholder = "Start writing…"
 read_only = "This file was made by a newer Bolh Place and is open read-only."
 
 [canvas]
-add_card = "New card (double-click the canvas)"
+tool_select = "Select (V)"
+tool_hand = "Hand: move the canvas (H)"
+tool_card = "Card (C)"
+place_card = "Click the canvas to place a card. Esc cancels."
+undo = "Undo (Ctrl+Z)"
+redo = "Redo (Ctrl+Y)"
 grid = "Grid and snapping"
 zoom_in = "Zoom in (Ctrl +)"
 zoom_out = "Zoom out (Ctrl −)"

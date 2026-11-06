@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use bolh_core::format::{Content, FileKind, Node};
 use bolh_core::settings::Settings;
 use bolh_core::space::{Clock, Space};
+use bolh_place::canvas_view::Tool;
 use bolh_place::workspace::Workspace;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
@@ -498,4 +499,150 @@ fn calm_canvas_does_not_redraw_by_itself(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert_eq!(asked, 0, "спокойный холст сам себя не перерисовывает");
+}
+
+fn tool(cx: &mut TestAppContext, fx: &Fx) -> Tool {
+    cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        ws.active_tab()
+            .unwrap()
+            .canvas_view()
+            .unwrap()
+            .read(cx)
+            .tool()
+    })
+}
+
+fn view_of(cx: &mut TestAppContext, fx: &Fx) -> bolh_core::canvas::View {
+    cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        ws.active_tab()
+            .unwrap()
+            .canvas_view()
+            .unwrap()
+            .read(cx)
+            .view()
+    })
+}
+
+#[gpui_kit::test]
+fn card_tool_places_a_card_where_clicked(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.click("canvas-tool-card", cx));
+    assert_eq!(tool(cx, &fx), Tool::Card);
+    // Пустое место у левого верхнего угла поля: карточка — посередине.
+    let at = bolh_core::canvas::Point { x: 60.0, y: 60.0 };
+    act(cx, &fx, |w, cx| {
+        w.click_at("canvas", point(px(at.x as f32), px(at.y as f32)), cx)
+    });
+    let world = view_of(cx, &fx).to_world(at);
+    let nodes = nodes_in_view(cx, &fx);
+    assert_eq!(nodes.len(), 2, "карточка поставлена");
+    let new = &nodes[1];
+    let (cx_, cy_) = (new.x + new.width / 2.0, new.y + new.height / 2.0);
+    // Угол карточки встаёт на сетку — середина сдвигается не больше чем на
+    // полшага.
+    assert!(
+        (cx_ - world.x).abs() <= 10.0 && (cy_ - world.y).abs() <= 10.0,
+        "карточка там, где щёлкнули: {cx_},{cy_} против {},{}",
+        world.x,
+        world.y
+    );
+    assert_eq!(tool(cx, &fx), Tool::Select, "дальше — снова выделение");
+    assert!(editing(cx, &fx), "сразу можно печатать");
+}
+
+#[gpui_kit::test]
+fn hand_tool_moves_the_field_even_over_a_card(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.press("h", cx));
+    assert_eq!(tool(cx, &fx), Tool::Hand);
+    let v0 = view_of(cx, &fx);
+    act(cx, &fx, |w, cx| {
+        let from = w.find("node:a").bounds().center();
+        w.drag(from, point(from.x + px(50.), from.y + px(30.)), cx);
+    });
+    let v1 = view_of(cx, &fx);
+    assert_eq!(
+        (v1.offset_x - v0.offset_x, v1.offset_y - v0.offset_y),
+        (50.0, 30.0),
+        "поле сдвинулось за мышью"
+    );
+    assert_eq!(
+        nodes_in_view(cx, &fx)[0].x,
+        0.0,
+        "карточка осталась на месте"
+    );
+    act(cx, &fx, |w, cx| w.press("v", cx));
+    assert_eq!(tool(cx, &fx), Tool::Select);
+}
+
+#[gpui_kit::test]
+fn escape_puts_the_card_tool_down(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.press("c", cx));
+    assert_eq!(tool(cx, &fx), Tool::Card);
+    act(cx, &fx, |w, cx| w.press("escape", cx));
+    assert_eq!(tool(cx, &fx), Tool::Select);
+    act(cx, &fx, |w, cx| {
+        w.click_at("canvas", point(px(60.), px(60.)), cx)
+    });
+    assert_eq!(
+        nodes_in_view(cx, &fx).len(),
+        1,
+        "щелчок больше не ставит карточку"
+    );
+}
+
+#[gpui_kit::test]
+fn canvas_keys_stay_quiet_while_typing_in_a_card(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    // Поле сдвинуто — «показать всё» было бы заметно.
+    act(cx, &fx, |w, cx| {
+        w.scroll("canvas", ScrollDelta::Pixels(point(px(0.), px(-100.))), cx)
+    });
+    let v0 = view_of(cx, &fx);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    act(cx, &fx, |w, cx| w.press("shift-1", cx));
+    act(cx, &fx, |w, cx| w.press("c", cx));
+    assert_eq!(view_of(cx, &fx), v0, "Shift+1 в тексте не показывает всё");
+    assert_eq!(
+        tool(cx, &fx),
+        Tool::Select,
+        "буква в тексте не включает инструмент"
+    );
+    assert!(editing(cx, &fx), "правка текста продолжается");
+}
+
+#[gpui_kit::test]
+fn toolbar_clicks_do_not_reach_the_field(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.click("node:a", cx));
+    act(cx, &fx, |w, cx| w.click("canvas-zoom-in", cx));
+    let selected = cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        let v = ws.active_tab().unwrap().canvas_view().unwrap().read(cx);
+        v.editor().selection().len()
+    });
+    assert_eq!(selected, 1, "кнопка масштаба не сняла выделение");
+    act(cx, &fx, |w, cx| w.click("canvas-tool-card", cx));
+    act(cx, &fx, |w, cx| w.click("canvas-tool-hand", cx));
+    assert_eq!(
+        nodes_in_view(cx, &fx).len(),
+        1,
+        "щелчок по панели не поставил карточку"
+    );
+    assert_eq!(tool(cx, &fx), Tool::Hand);
+}
+
+#[gpui_kit::test]
+fn undo_and_redo_buttons(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.click("node:a", cx));
+    act(cx, &fx, |w, cx| w.press("right", cx));
+    assert_eq!(nodes_in_view(cx, &fx)[0].x, 1.0);
+    act(cx, &fx, |w, cx| w.click("canvas-undo", cx));
+    assert_eq!(nodes_in_view(cx, &fx)[0].x, 0.0, "отменено");
+    act(cx, &fx, |w, cx| w.click("canvas-redo", cx));
+    assert_eq!(nodes_in_view(cx, &fx)[0].x, 1.0, "повторено");
 }

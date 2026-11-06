@@ -4,7 +4,8 @@
 //! Координаты здесь — «мировые», в пикселях холста при масштабе 100%.
 //! Перевод в точки экрана — забота интерфейса.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -188,50 +189,99 @@ pub struct Snap {
     pub guides: Vec<Guide>,
 }
 
-/// Куда прилипнуть перемещаемому прямоугольнику.
-///
-/// Сначала — к краям и серединам других объектов, если они ближе
-/// `threshold`: выровнять по соседу важнее, чем по сетке. Иначе, если
-/// сетка включена, — левый верхний угол к ближайшему узлу сетки. По осям
-/// независимо: можно прилипнуть к соседу по горизонтали и к сетке по
-/// вертикали.
-pub fn snap(moving: Rect, others: &[Rect], grid: Option<f64>, threshold: f64) -> Snap {
-    let mut out = Snap::default();
-    let best = |mine: [f64; 3], theirs: &mut dyn Iterator<Item = [f64; 3]>| {
-        let mut best: Option<(f64, f64)> = None; // (поправка, линия)
-        for t in theirs {
-            for m in mine {
-                for line in t {
-                    let d = line - m;
-                    if d.abs() <= threshold && best.is_none_or(|(b, _)| d.abs() < b.abs()) {
-                        best = Some((d, line));
-                    }
-                }
-            }
-        }
-        best
-    };
-    match best(moving.xs(), &mut others.iter().map(Rect::xs)) {
-        Some((d, line)) => {
-            out.dx = d;
-            out.guides.push(Guide::Vertical(line));
-        }
-        None => {
-            if let Some(g) = grid {
-                out.dx = (moving.x / g).round() * g - moving.x;
+/// Ближайшая к одному из моих краёв чужая линия, если ближе `threshold`:
+/// (поправка, линия).
+fn nearest(mine: &[f64], lines: impl Iterator<Item = f64>, threshold: f64) -> Option<(f64, f64)> {
+    let mut best: Option<(f64, f64)> = None;
+    for line in lines {
+        for m in mine {
+            let d = line - m;
+            if d.abs() <= threshold && best.is_none_or(|(b, _)| d.abs() < b.abs()) {
+                best = Some((d, line));
             }
         }
     }
-    match best(moving.ys(), &mut others.iter().map(Rect::ys)) {
-        Some((d, line)) => {
-            out.dy = d;
-            out.guides.push(Guide::Horizontal(line));
-        }
-        None => {
-            if let Some(g) = grid {
-                out.dy = (moving.y / g).round() * g - moving.y;
-            }
-        }
+    best
+}
+
+/// Притяжение к линии сетки — только когда край уже рядом с ней. Всегда
+/// округлять до сетки нельзя: объект шёл бы за мышью рывками по 20 точек,
+/// и это ощущалось как тормоза.
+fn grid_pull(v: f64, grid: f64, threshold: f64) -> Option<f64> {
+    let d = (v / grid).round() * grid - v;
+    (d.abs() <= threshold).then_some(d)
+}
+
+/// Прилипание по одной оси: к соседу важнее, чем к сетке.
+fn snap_axis(
+    mine: &[f64],
+    lines: impl Iterator<Item = f64>,
+    grid_edge: f64,
+    grid: Option<f64>,
+    threshold: f64,
+) -> (f64, Option<f64>) {
+    match nearest(mine, lines, threshold) {
+        Some((d, line)) => (d, Some(line)),
+        None => (
+            grid.and_then(|g| grid_pull(grid_edge, g, threshold))
+                .unwrap_or(0.0),
+            None,
+        ),
+    }
+}
+
+/// Куда прилипнуть перемещаемому прямоугольнику.
+///
+/// К краям и серединам других объектов, если они ближе `threshold`;
+/// иначе, если сетка включена и левый (верхний) край рядом с линией
+/// сетки, — к ней. Оси независимы. Вдали от линий объект идёт точно за
+/// мышью.
+pub fn snap(moving: Rect, others: &[Rect], grid: Option<f64>, threshold: f64) -> Snap {
+    let (dx, vx) = snap_axis(
+        &moving.xs(),
+        others.iter().flat_map(Rect::xs),
+        moving.x,
+        grid,
+        threshold,
+    );
+    let (dy, hy) = snap_axis(
+        &moving.ys(),
+        others.iter().flat_map(Rect::ys),
+        moving.y,
+        grid,
+        threshold,
+    );
+    Snap {
+        dx,
+        dy,
+        guides: vx
+            .map(Guide::Vertical)
+            .into_iter()
+            .chain(hy.map(Guide::Horizontal))
+            .collect(),
+    }
+}
+
+/// Прилипание тянущихся краёв при изменении размера: `x` — где сейчас
+/// вертикальный край, который тянут, `y` — горизонтальный (`None` — этот
+/// край не тянется).
+pub fn snap_edges(
+    x: Option<f64>,
+    y: Option<f64>,
+    others: &[Rect],
+    grid: Option<f64>,
+    threshold: f64,
+) -> Snap {
+    let mut out = Snap::default();
+    if let Some(x) = x {
+        let (d, line) = snap_axis(&[x], others.iter().flat_map(Rect::xs), x, grid, threshold);
+        out.dx = d;
+        out.guides.extend(line.map(Guide::Vertical));
+    }
+    if let Some(y) = y {
+        let (d, line) = snap_axis(&[y], others.iter().flat_map(Rect::ys), y, grid, threshold);
+        out.dy = d;
+        out.guides.extend(line.map(Guide::Horizontal));
     }
     out
 }
@@ -245,35 +295,100 @@ struct Clip {
     nodes: Vec<Node>,
 }
 
+/// Одинаковы ли два набора объектов. Сначала сравниваем указатели: у
+/// снимка отмены и текущего состояния неизменённые объекты общие.
+fn same_nodes(a: &[Arc<Node>], b: &[Arc<Node>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
+}
+
 /// Открытый холст: содержимое, выделение и история правок.
+///
+/// Объекты лежат в `Arc`: снимок для отмены копирует только указатели, а
+/// сам объект копируется, лишь когда его меняют. Поэтому 200 шагов отмены
+/// на холсте в 5000 объектов не съедают сотни мегабайт.
 #[derive(Debug, Clone)]
 pub struct Editor {
-    canvas: Canvas,
+    /// Всё, кроме объектов: формат, id, связи, неизвестные поля.
+    meta: Canvas,
+    nodes: Vec<Arc<Node>>,
+    /// id → место в `nodes`. Без него поиск по id перебирал бы весь холст,
+    /// и на 5000 объектах кадр стоил десятки миллисекунд.
+    index: HashMap<String, usize>,
     selection: Vec<String>,
-    undo: Vec<Vec<Node>>,
-    redo: Vec<Vec<Node>>,
+    selected: HashSet<String>,
+    /// Высота объекта на экране, если текст сделал его выше заданной, в
+    /// точках холста. Только для показа и попадания мышью — в файл не
+    /// пишется: файл меняется лишь от действий человека.
+    shown: HashMap<String, f64>,
+    undo: Vec<Vec<Arc<Node>>>,
+    redo: Vec<Vec<Arc<Node>>>,
 }
 
 impl Editor {
-    pub fn new(canvas: Canvas) -> Self {
-        Editor {
-            canvas,
+    pub fn new(mut canvas: Canvas) -> Self {
+        let nodes = std::mem::take(&mut canvas.nodes)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let mut e = Editor {
+            meta: canvas,
+            nodes,
+            index: HashMap::new(),
             selection: Vec::new(),
+            selected: HashSet::new(),
+            shown: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
-        }
+        };
+        e.reindex();
+        e
     }
 
-    pub fn canvas(&self) -> &Canvas {
-        &self.canvas
+    fn reindex(&mut self) {
+        self.index = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.clone(), i))
+            .collect();
     }
 
-    pub fn nodes(&self) -> &[Node] {
-        &self.canvas.nodes
+    /// Холст со всеми правками — для сохранения.
+    pub fn to_canvas(&self) -> Canvas {
+        let mut c = self.meta.clone();
+        c.nodes = self.nodes.iter().map(|n| (**n).clone()).collect();
+        c
+    }
+
+    pub fn nodes(&self) -> &[Arc<Node>] {
+        &self.nodes
     }
 
     pub fn node(&self, id: &str) -> Option<&Node> {
-        self.canvas.nodes.iter().find(|n| n.id == id)
+        self.index.get(id).map(|&i| &*self.nodes[i])
+    }
+
+    fn node_mut(&mut self, id: &str) -> Option<&mut Node> {
+        let i = *self.index.get(id)?;
+        Some(Arc::make_mut(&mut self.nodes[i]))
+    }
+
+    /// Прямоугольник объекта, как его видит человек: с высотой по тексту.
+    pub fn rect(&self, n: &Node) -> Rect {
+        let mut r = Rect::of(n);
+        if let Some(&h) = self.shown.get(&n.id) {
+            r.h = r.h.max(h);
+        }
+        r
+    }
+
+    pub fn rect_of(&self, id: &str) -> Option<Rect> {
+        self.node(id).map(|n| self.rect(n))
+    }
+
+    /// Интерфейс сообщает, какой высоты объект вышел на экране.
+    pub fn set_shown_height(&mut self, id: &str, h: f64) {
+        self.shown.insert(id.to_string(), h);
     }
 
     pub fn selection(&self) -> &[String] {
@@ -281,7 +396,7 @@ impl Editor {
     }
 
     pub fn is_selected(&self, id: &str) -> bool {
-        self.selection.iter().any(|s| s == id)
+        self.selected.contains(id)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -292,21 +407,25 @@ impl Editor {
         !self.redo.is_empty()
     }
 
-    /// Запоминает состояние перед правкой. Перетаскивание вызывает его один
-    /// раз в начале, и тогда вся протяжка отменяется одним Ctrl+Z.
-    pub fn checkpoint(&mut self) {
-        self.undo.push(self.canvas.nodes.clone());
+    fn push_undo(&mut self, snapshot: Vec<Arc<Node>>) {
+        self.undo.push(snapshot);
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
         self.redo.clear();
     }
 
+    /// Запоминает состояние перед правкой. Перетаскивание вызывает его один
+    /// раз в начале, и тогда вся протяжка отменяется одним Ctrl+Z.
+    pub fn checkpoint(&mut self) {
+        self.push_undo(self.nodes.clone());
+    }
+
     /// Убирает последнюю точку отмены, если после неё ничего не поменялось
     /// (щёлкнули по карточке, но не сдвинули).
     /// `true`, если точка оказалась пустой и убрана.
     pub fn drop_empty_checkpoint(&mut self) -> bool {
-        if self.undo.last() == Some(&self.canvas.nodes) {
+        if self.undo.last().is_some_and(|u| same_nodes(u, &self.nodes)) {
             self.undo.pop();
             true
         } else {
@@ -318,8 +437,9 @@ impl Editor {
         let Some(prev) = self.undo.pop() else {
             return false;
         };
-        let now = std::mem::replace(&mut self.canvas.nodes, prev);
+        let now = std::mem::replace(&mut self.nodes, prev);
         self.redo.push(now);
+        self.reindex();
         self.keep_selection_valid();
         true
     }
@@ -328,79 +448,93 @@ impl Editor {
         let Some(next) = self.redo.pop() else {
             return false;
         };
-        let now = std::mem::replace(&mut self.canvas.nodes, next);
+        let now = std::mem::replace(&mut self.nodes, next);
         self.undo.push(now);
+        self.reindex();
         self.keep_selection_valid();
         true
     }
 
     fn keep_selection_valid(&mut self) {
-        let ids: HashSet<&str> = self.canvas.nodes.iter().map(|n| n.id.as_str()).collect();
-        self.selection.retain(|s| ids.contains(s.as_str()));
+        let index = &self.index;
+        self.selection.retain(|s| index.contains_key(s));
+        self.selected.retain(|s| index.contains_key(s));
     }
 
     // ---- Выделение -------------------------------------------------------
 
     /// Верхний объект под точкой.
     pub fn hit(&self, p: Point) -> Option<&str> {
-        self.canvas
-            .nodes
+        self.nodes
             .iter()
             .rev()
-            .find(|n| Rect::of(n).contains(p))
+            .find(|n| self.rect(n).contains(p))
             .map(|n| n.id.as_str())
     }
 
+    fn set_selection(&mut self, ids: Vec<String>) {
+        self.selected = ids.iter().cloned().collect();
+        self.selection = ids;
+    }
+
     pub fn select_only(&mut self, id: &str) {
-        self.selection = vec![id.to_string()];
+        self.set_selection(vec![id.to_string()]);
     }
 
     /// Ctrl/Shift+щелчок: добавить или убрать из выделения.
     pub fn toggle_selected(&mut self, id: &str) {
-        if let Some(i) = self.selection.iter().position(|s| s == id) {
-            self.selection.remove(i);
+        if self.selected.remove(id) {
+            self.selection.retain(|s| s != id);
         } else {
+            self.selected.insert(id.to_string());
             self.selection.push(id.to_string());
         }
     }
 
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+        self.selected.clear();
     }
 
     pub fn select_all(&mut self) {
-        self.selection = self.canvas.nodes.iter().map(|n| n.id.clone()).collect();
+        let all = self.nodes.iter().map(|n| n.id.clone()).collect();
+        self.set_selection(all);
     }
 
     /// Рамка выделения: всё, что задевает прямоугольник. С `add` —
     /// добавить к уже выделенному.
     pub fn select_in(&mut self, r: Rect, add: bool) {
         if !add {
-            self.selection.clear();
+            self.clear_selection();
         }
-        for n in &self.canvas.nodes {
-            if Rect::of(n).intersects(&r) && !self.selection.contains(&n.id) {
-                self.selection.push(n.id.clone());
-            }
+        let hits: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| self.rect(n).intersects(&r) && !self.selected.contains(&n.id))
+            .map(|n| n.id.clone())
+            .collect();
+        for id in hits {
+            self.selected.insert(id.clone());
+            self.selection.push(id);
         }
     }
 
     pub fn selection_bounds(&self) -> Option<Rect> {
-        self.canvas
-            .nodes
+        self.selection
             .iter()
-            .filter(|n| self.is_selected(&n.id))
-            .map(Rect::of)
+            .filter_map(|id| self.rect_of(id))
             .reduce(|a, b| a.union(&b))
     }
 
-    /// Все объекты вне выделения — к ним прилипает перемещаемое.
-    pub fn unselected_rects(&self) -> Vec<Rect> {
-        self.canvas
-            .nodes
+    /// Объекты вне выделения, задевающие `area`, — к ним прилипает
+    /// перемещаемое. Дальние не нужны: прилипать к невидимому странно, а
+    /// перебирать их каждый кадр — дорого.
+    pub fn unselected_rects_in(&self, area: Rect) -> Vec<Rect> {
+        self.nodes
             .iter()
-            .filter(|n| !self.is_selected(&n.id))
-            .map(Rect::of)
+            .filter(|n| !self.selected.contains(&n.id))
+            .map(|n| self.rect(n))
+            .filter(|r| r.intersects(&area))
             .collect()
     }
 
@@ -417,24 +551,27 @@ impl Editor {
             y = (y / g).round() * g;
         }
         let id = Uuid::new_v4().to_string();
-        self.canvas.nodes.push(Node::card(id.clone(), x, y, w, h));
+        self.nodes
+            .push(Arc::new(Node::card(id.clone(), x, y, w, h)));
+        self.index.insert(id.clone(), self.nodes.len() - 1);
         self.select_only(&id);
         id
     }
 
     /// Сдвигает выделенное. Точку отмены ставит вызывающий.
     pub fn move_selection(&mut self, dx: f64, dy: f64) {
-        let sel: HashSet<String> = self.selection.iter().cloned().collect();
-        for n in self.canvas.nodes.iter_mut().filter(|n| sel.contains(&n.id)) {
-            n.x += dx;
-            n.y += dy;
+        for id in self.selection.clone() {
+            if let Some(n) = self.node_mut(&id) {
+                n.x += dx;
+                n.y += dy;
+            }
         }
     }
 
     /// Задаёт объекту размер и место, не меньше [`MIN_SIZE`]. Точку отмены
     /// ставит вызывающий.
     pub fn set_rect(&mut self, id: &str, r: Rect) {
-        if let Some(n) = self.canvas.nodes.iter_mut().find(|n| n.id == id) {
+        if let Some(n) = self.node_mut(id) {
             n.x = r.x;
             n.y = r.y;
             n.width = r.w.max(MIN_SIZE.0);
@@ -445,8 +582,17 @@ impl Editor {
     /// Меняет текст карточки. Точку отмены ставит вызывающий — один раз за
     /// всё время правки текста, а не на каждую букву.
     pub fn set_text(&mut self, id: &str, text: &str) {
-        if let Some(n) = self.canvas.nodes.iter_mut().find(|n| n.id == id) {
+        if let Some(n) = self.node_mut(id)
+            && n.text != text
+        {
             n.text = text.to_string();
+        }
+    }
+
+    /// Меняет объект целиком через функцию. Точку отмены ставит вызывающий.
+    pub fn update_node(&mut self, id: &str, f: impl FnOnce(&mut Node)) {
+        if let Some(n) = self.node_mut(id) {
+            f(n);
         }
     }
 
@@ -455,33 +601,35 @@ impl Editor {
             return false;
         }
         self.checkpoint();
-        let sel: HashSet<String> = self.selection.drain(..).collect();
-        self.canvas.nodes.retain(|n| !sel.contains(&n.id));
+        let sel = std::mem::take(&mut self.selected);
+        self.selection.clear();
+        self.nodes.retain(|n| !sel.contains(&n.id));
+        for id in &sel {
+            self.shown.remove(id);
+        }
+        self.reindex();
         true
     }
 
     // ---- Порядок слоёв ---------------------------------------------------
 
-    fn reorder(&mut self, f: impl FnOnce(&mut Vec<Node>, &HashSet<String>)) {
+    fn reorder(&mut self, f: impl FnOnce(&mut Vec<Arc<Node>>, &HashSet<String>)) {
         if self.selection.is_empty() {
             return;
         }
-        let before = self.canvas.nodes.clone();
-        let sel: HashSet<String> = self.selection.iter().cloned().collect();
-        f(&mut self.canvas.nodes, &sel);
-        if self.canvas.nodes != before {
-            self.undo.push(before);
-            if self.undo.len() > UNDO_LIMIT {
-                self.undo.remove(0);
-            }
-            self.redo.clear();
+        let before = self.nodes.clone();
+        let sel = self.selected.clone();
+        f(&mut self.nodes, &sel);
+        if !same_nodes(&self.nodes, &before) {
+            self.push_undo(before);
+            self.reindex();
         }
     }
 
     /// На самый верх, сохраняя порядок выделенных между собой.
     pub fn bring_to_front(&mut self) {
         self.reorder(|nodes, sel| {
-            let (picked, rest): (Vec<Node>, Vec<Node>) =
+            let (picked, rest): (Vec<_>, Vec<_>) =
                 nodes.drain(..).partition(|n| sel.contains(&n.id));
             nodes.extend(rest);
             nodes.extend(picked);
@@ -490,7 +638,7 @@ impl Editor {
 
     pub fn send_to_back(&mut self) {
         self.reorder(|nodes, sel| {
-            let (picked, rest): (Vec<Node>, Vec<Node>) =
+            let (picked, rest): (Vec<_>, Vec<_>) =
                 nodes.drain(..).partition(|n| sel.contains(&n.id));
             nodes.extend(picked);
             nodes.extend(rest);
@@ -522,13 +670,13 @@ impl Editor {
     // ---- Буфер обмена ----------------------------------------------------
 
     /// Выделенное как текст для буфера обмена. Пусто — нечего копировать.
+    /// Порядок — как на холсте, снизу вверх.
     pub fn copy_selection(&self) -> Option<String> {
         let nodes: Vec<Node> = self
-            .canvas
             .nodes
             .iter()
-            .filter(|n| self.is_selected(&n.id))
-            .cloned()
+            .filter(|n| self.selected.contains(&n.id))
+            .map(|n| (**n).clone())
             .collect();
         if nodes.is_empty() {
             return None;
@@ -547,14 +695,16 @@ impl Editor {
             return false;
         }
         self.checkpoint();
-        self.selection.clear();
+        let mut ids = Vec::new();
         for mut n in clip.nodes {
             n.id = Uuid::new_v4().to_string();
             n.x += offset;
             n.y += offset;
-            self.selection.push(n.id.clone());
-            self.canvas.nodes.push(n);
+            ids.push(n.id.clone());
+            self.nodes.push(Arc::new(n));
         }
+        self.reindex();
+        self.set_selection(ids);
         true
     }
 
@@ -566,17 +716,22 @@ impl Editor {
         }
     }
 
-    /// Холст с правками — для сохранения через ядро.
-    pub fn into_canvas(self) -> Canvas {
-        self.canvas
-    }
-
     /// Подменяет содержимое (пришла версия из облака). История отмены
     /// сбрасывается: её шаги относились к старому содержимому.
+    pub fn id(&self) -> uuid::Uuid {
+        self.meta.id
+    }
+
+    /// Холст стал другим файлом — копией после расхождения — со своей
+    /// историей. Отмене это не подлежит: id не правка человека.
+    pub fn set_id(&mut self, id: uuid::Uuid) {
+        self.meta.id = id;
+    }
+
     pub fn replace_canvas(&mut self, canvas: Canvas) {
-        self.canvas = canvas;
-        self.undo.clear();
-        self.redo.clear();
+        let selection = std::mem::take(&mut self.selection);
+        *self = Editor::new(canvas);
+        self.set_selection(selection);
         self.keep_selection_valid();
     }
 }
@@ -780,11 +935,31 @@ mod tests {
     }
 
     #[test]
-    fn snap_to_grid_when_no_neighbour() {
-        let s = snap(r(8.0, 29.0, 100.0, 50.0), &[], Some(20.0), 6.0);
-        assert_eq!((s.dx, s.dy), (-8.0, -9.0));
+    fn grid_pulls_only_when_near_a_line() {
+        // Рядом с линией сетки — прилипает.
+        let s = snap(r(17.0, 23.0, 100.0, 50.0), &[], Some(20.0), 6.0);
+        assert_eq!((s.dx, s.dy), (3.0, -3.0));
         assert!(s.guides.is_empty());
-        let s = snap(r(13.0, 29.0, 100.0, 50.0), &[], None, 6.0);
+        // Посередине между линиями — идёт точно за мышью, без рывка.
+        let s = snap(r(10.0, 30.0, 100.0, 50.0), &[], Some(20.0), 6.0);
+        assert_eq!((s.dx, s.dy), (0.0, 0.0));
+        let s = snap(r(17.0, 23.0, 100.0, 50.0), &[], None, 6.0);
+        assert_eq!((s.dx, s.dy), (0.0, 0.0), "сетка выключена");
+    }
+
+    #[test]
+    fn resize_edges_snap_to_neighbours_then_grid() {
+        let other = r(200.0, 0.0, 100.0, 100.0);
+        // Правый край у левого края соседа — к нему, с направляющей.
+        let s = snap_edges(Some(197.0), None, &[other], Some(20.0), 6.0);
+        assert_eq!(s.dx, 3.0);
+        assert_eq!(s.guides, [Guide::Vertical(200.0)]);
+        // Нижний край у линии сетки — к ней, без направляющей.
+        let s = snap_edges(None, Some(398.0), &[other], Some(20.0), 6.0);
+        assert_eq!(s.dy, 2.0);
+        assert!(s.guides.is_empty());
+        // Далеко от всего — точно за мышью.
+        let s = snap_edges(Some(150.0), Some(350.0), &[other], Some(20.0), 6.0);
         assert_eq!((s.dx, s.dy), (0.0, 0.0));
     }
 
@@ -818,6 +993,66 @@ mod tests {
     }
 
     #[test]
+    fn shown_height_counts_for_hits_and_selection_but_not_the_file() {
+        let mut e = ed();
+        let a = e.add_card(p(0.0, 0.0), None); // y от -70 до 70
+        assert_eq!(e.hit(p(0.0, 100.0)), None);
+        e.set_shown_height(&a, 200.0); // текст вытянул карточку до y=130
+        assert_eq!(e.hit(p(0.0, 100.0)), Some(a.as_str()));
+        assert_eq!(e.selection_bounds().unwrap().h, 200.0);
+        assert_eq!(
+            e.node(&a).unwrap().height,
+            140.0,
+            "в файле — заданная высота"
+        );
+        assert_eq!(e.to_canvas().nodes[0].height, 140.0);
+        // Меньше заданной высота на экране не бывает.
+        e.set_shown_height(&a, 10.0);
+        assert_eq!(e.rect_of(&a).unwrap().h, 140.0);
+    }
+
+    #[test]
+    fn undo_snapshots_share_unchanged_nodes() {
+        let mut e = ed();
+        for i in 0..100 {
+            e.add_card(p(i as f64 * 300.0, 0.0), None);
+        }
+        let first = e.nodes()[0].id.clone();
+        e.select_only(&first);
+        e.checkpoint();
+        e.move_selection(5.0, 0.0);
+        let snap = e.undo.last().unwrap();
+        let shared = snap
+            .iter()
+            .zip(e.nodes())
+            .filter(|(a, b)| Arc::ptr_eq(a, b))
+            .count();
+        assert_eq!(shared, 99, "скопирован только сдвинутый объект");
+    }
+
+    #[test]
+    fn lookups_stay_correct_after_structural_changes() {
+        let mut e = ed();
+        let a = e.add_card(p(0.0, 0.0), None);
+        let b = e.add_card(p(300.0, 0.0), None);
+        e.select_only(&a);
+        e.bring_to_front();
+        assert_eq!(e.node(&a).unwrap().id, a);
+        assert_eq!(e.node(&b).unwrap().id, b);
+        e.delete_selection();
+        assert!(e.node(&a).is_none());
+        assert_eq!(e.node(&b).unwrap().id, b);
+        e.undo();
+        assert_eq!(e.node(&a).unwrap().id, a);
+        e.select_all();
+        e.duplicate();
+        assert_eq!(e.nodes().len(), 4);
+        for n in e.nodes() {
+            assert_eq!(e.node(&n.id).unwrap().id, n.id);
+        }
+    }
+
+    #[test]
     fn replace_from_cloud_resets_history() {
         let mut e = ed();
         let a = e.add_card(p(0.0, 0.0), None);
@@ -827,7 +1062,8 @@ mod tests {
             .push(Node::card(a.clone(), 5.0, 5.0, 10.0, 10.0));
         e.replace_canvas(other);
         assert!(!e.can_undo());
-        assert_eq!(e.selection(), [a]);
+        assert_eq!(e.selection(), std::slice::from_ref(&a));
+        assert!(e.is_selected(&a));
         e.replace_canvas(Canvas::new());
         assert!(e.selection().is_empty());
     }

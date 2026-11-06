@@ -105,7 +105,7 @@ fn new_document_button_creates_file_and_typing_is_saved(cx: &mut TestAppContext)
     let rel = cx.read(|cx| ws.read(cx).active_tab().unwrap().file.rel.clone());
     assert_eq!(rel, PathBuf::from("Без названия.bdoc"));
     assert_eq!(doc_text(&fx.root, &rel), "Привет, план");
-    cx.read(|cx| assert!(!ws.read(cx).active_tab().unwrap().file.is_dirty()));
+    cx.read(|cx| assert!(!ws.read(cx).active_tab().unwrap().unsaved()));
 }
 
 #[gpui_kit::test]
@@ -243,13 +243,15 @@ fn change_from_cloud_is_shown_when_no_local_edits(cx: &mut TestAppContext) {
         ws.update(cx, |ws, cx| ws.poll_external(window, cx));
     })
     .unwrap();
+    // Проверка идёт в фоне.
+    cx.run_until_parked();
     cx.read(|cx| {
         let tab = ws.read(cx).active_tab().unwrap();
         let Content::Document(d) = &tab.file.content else {
             panic!()
         };
         assert_eq!(d.plain_text(), "с ноутбука");
-        assert!(!tab.file.is_dirty());
+        assert!(!tab.unsaved());
     });
 }
 
@@ -274,6 +276,8 @@ fn simultaneous_edit_keeps_both_versions(cx: &mut TestAppContext) {
         });
     })
     .unwrap();
+    // Проверка и сохранение идут в фоне.
+    cx.run_until_parked();
     assert_eq!(doc_text(&fx.root, &rel), "чужое", "чужая правка не затёрта");
     let copy = cx.read(|cx| ws.read(cx).active_tab().unwrap().file.rel.clone());
     assert_ne!(copy, rel);
@@ -371,4 +375,61 @@ fn autosave_of_one_tab_is_not_cancelled_by_another(cx: &mut TestAppContext) {
         doc_text(&fx.root, Path::new("Без названия 2.bdoc")),
         "второй"
     );
+}
+
+#[gpui_kit::test]
+fn typing_during_a_background_save_is_saved_next(cx: &mut TestAppContext) {
+    let (fx, settings) = fixture(&["Работа"]);
+    let (handle, ws) = open(cx, settings, &fx.settings_path);
+    step(cx, handle, |window, cx| window.click("new-document", cx));
+    step(cx, handle, |window, cx| window.input("один", cx));
+    // Сохранение ушло в фон, а человек печатает дальше, не дожидаясь диска.
+    cx.update_window(handle, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.save_active(window, cx));
+        window.input(" два", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let rel = Path::new("Без названия.bdoc");
+    assert_eq!(doc_text(&fx.root, rel), "один", "записано то, что было");
+    cx.read(|cx| assert!(ws.read(cx).active_tab().unwrap().unsaved()));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(doc_text(&fx.root, rel), "один два", "и допечатанное тоже");
+    cx.read(|cx| assert!(!ws.read(cx).active_tab().unwrap().unsaved()));
+}
+
+#[gpui_kit::test]
+fn closing_waits_for_a_background_save_without_a_false_conflict(cx: &mut TestAppContext) {
+    let (fx, settings) = fixture(&["Работа"]);
+    let (handle, ws) = open(cx, settings, &fx.settings_path);
+    step(cx, handle, |window, cx| window.click("new-document", cx));
+    step(cx, handle, |window, cx| window.input("один", cx));
+    cx.update_window(handle, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.save_active(window, cx));
+        window.input(" два", cx);
+    })
+    .unwrap();
+    // Окно закрывают, пока фоновое сохранение не дописано.
+    cx.update_window(handle, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.save_all(window, cx));
+    })
+    .unwrap();
+    let rel = Path::new("Без названия.bdoc");
+    assert_eq!(doc_text(&fx.root, rel), "один два", "всё записано сразу");
+    cx.run_until_parked();
+    // Две записи одного файла не приняли друг друга за чужую правку.
+    let files: Vec<String> = std::fs::read_dir(&fx.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".bdoc"))
+        .collect();
+    assert_eq!(files, ["Без названия.bdoc"], "без копий-расхождений");
+    assert_eq!(doc_text(&fx.root, rel), "один два");
+    cx.read(|cx| {
+        let tab = ws.read(cx).active_tab().unwrap();
+        assert_eq!(tab.file.rel, rel);
+        assert!(!tab.unsaved());
+    });
 }

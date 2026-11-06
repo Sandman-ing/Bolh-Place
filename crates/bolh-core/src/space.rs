@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
@@ -73,8 +74,10 @@ pub struct Entry {
 pub struct OpenFile {
     pub rel: PathBuf,
     pub content: Content,
-    /// Байты на диске — по ним видно чужую правку.
-    base: Vec<u8>,
+    /// Байты на диске — по ним видно чужую правку. Общие с пробами для
+    /// фоновой проверки: ради неё файл не копируется, а по указателю видно,
+    /// сменилась ли база с тех пор, как пробу сняли.
+    base: Arc<[u8]>,
     /// Те же байты, разобранные. Сравнение по смыслу, а не по байтам: файл,
     /// поправленный руками с другими отступами, не считается изменённым.
     base_content: Content,
@@ -86,7 +89,7 @@ impl OpenFile {
             rel,
             base_content: content.clone(),
             content,
-            base,
+            base: base.into(),
         }
     }
 
@@ -96,9 +99,49 @@ impl OpenFile {
     }
 
     fn set_base(&mut self, base: Vec<u8>) {
-        self.base = base;
+        self.base = base.into();
         self.base_content = self.content.clone();
     }
+
+    /// Всё, что нужно, чтобы проверить файл на чужую правку в другом потоке.
+    pub fn probe(&self) -> Probe {
+        Probe {
+            rel: self.rel.clone(),
+            kind: self.content.kind(),
+            base: self.base.clone(),
+        }
+    }
+
+    /// Проба снята с файла в нынешнем виде: с тех пор его не сохраняли, не
+    /// перечитывали и не переименовывали. Ответ по устаревшей пробе — про
+    /// прежнее состояние файла, применять его нельзя: своя же запись
+    /// показалась бы чужой.
+    pub fn is_current(&self, probe: &Probe) -> bool {
+        self.rel == probe.rel && Arc::ptr_eq(&self.base, &probe.base)
+    }
+
+    /// Принимает итог сохранения, сделанного над копией этого файла — в
+    /// другом потоке, пока человек правил дальше. Правки, сделанные за это
+    /// время, остаются. От копии берутся то, что теперь на диске, и путь с
+    /// id: после расхождения копия уже другой файл со своей историей.
+    pub fn adopt_saved(&mut self, saved: OpenFile) {
+        self.rel = saved.rel;
+        let id = saved.content.id();
+        if self.content.id() != id {
+            self.content.set_id(id);
+        }
+        self.base = saved.base;
+        self.base_content = saved.base_content;
+    }
+}
+
+/// Снимок открытого файла для проверки в фоне: путь, вид и байты, какими
+/// программа видела файл на диске.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub rel: PathBuf,
+    kind: FileKind,
+    base: Arc<[u8]>,
 }
 
 /// Что случилось с файлом на диске, пока он был открыт.
@@ -125,6 +168,9 @@ pub enum SaveOutcome {
     },
 }
 
+/// Пространство — это только путь к папке, поэтому его можно копировать
+/// в фоновые задачи: сохранение и проверка файлов идут не в главном потоке.
+#[derive(Debug, Clone)]
 pub struct Space {
     root: PathBuf,
 }
@@ -381,14 +427,20 @@ impl Space {
     /// Смотрит, не изменили ли файл снаружи. Ничего не меняет: решение —
     /// перечитать или оставить правки — за интерфейсом.
     pub fn check_external(&self, file: &OpenFile) -> External {
-        let path = match self.resolve(&file.rel) {
+        self.check(&file.probe())
+    }
+
+    /// То же по пробе: можно звать из другого потока, пока открытый файл
+    /// правят дальше.
+    pub fn check(&self, probe: &Probe) -> External {
+        let path = match self.resolve(&probe.rel) {
             Ok(p) => p,
             Err(e) => return External::Unreadable(e),
         };
         match read_optional(&path) {
             Ok(None) => External::Deleted,
-            Ok(Some(b)) if b == file.base => External::Unchanged,
-            Ok(Some(b)) => match Content::parse(file.content.kind(), &b, &path) {
+            Ok(Some(b)) if b[..] == probe.base[..] => External::Unchanged,
+            Ok(Some(b)) => match Content::parse(probe.kind, &b, &path) {
                 Ok(c) => External::Changed(Box::new(c), b),
                 Err(e) => External::Unreadable(e),
             },
@@ -426,7 +478,7 @@ impl Space {
         let disk = read_optional(&path)?;
         let ours_or_same = match &disk {
             None => true,
-            Some(d) => *d == file.base || *d == bytes,
+            Some(d) => d[..] == file.base[..] || *d == bytes,
         };
         if ours_or_same {
             if disk.as_deref() != Some(&bytes[..]) {

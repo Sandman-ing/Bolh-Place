@@ -4,13 +4,16 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bolh_core::format::{Content, FileKind};
 use bolh_core::settings::{Settings, ThemeChoice};
-use bolh_core::space::{Clock, Entry, EntryKind, External, OpenFile, SaveOutcome, Space};
+use bolh_core::space::{Clock, Entry, EntryKind, External, OpenFile, Probe, SaveOutcome, Space};
 use bolh_core::trash::TrashEntry;
 use bolh_core::update::Release;
+use futures::FutureExt as _;
+use futures::future::Shared;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
@@ -45,6 +48,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Открытая вкладка.
 pub struct OpenTab {
     id: u64,
+    /// Файл, каким его видели на диске. Содержимое холста сюда попадает
+    /// только перед сохранением: копировать весь холст на каждую правку
+    /// незачем.
     pub file: OpenFile,
     /// Поле заглушки редактора — только у документов.
     editor: Option<Entity<TextareaState>>,
@@ -52,15 +58,71 @@ pub struct OpenTab {
     canvas: Option<Entity<CanvasView>>,
     /// О чужой правке уже сказали — не повторять каждые две секунды.
     external_noticed: bool,
+    /// Сколько правок сделано во вкладке и по какую из них всё на диске.
+    /// «Не сохранено» — их неравенство: значок на вкладке проверяется в
+    /// каждом кадре, и сравнивать там весь холст с сохранённым дорого.
+    edits: u64,
+    saved_edits: u64,
     /// Отложенное автосохранение. У каждой вкладки своё: правка в одной
     /// вкладке не должна отменять сохранение другой.
     autosave: Option<Task<()>>,
+    /// Сохранение, которое сейчас идёт в фоне. Второе одновременно не
+    /// начинается: два писателя одного файла приняли бы запись друг друга
+    /// за чужую правку и наплодили копий.
+    saving: Option<Saving>,
+    /// Пока шло сохранение, подошло время следующего.
+    save_again: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Сохранение в фоне. Итог кладёт фоновая задача, а забирает тот, кто
+/// дождётся первым: обычный ход событий или закрытие окна, которому
+/// ждать своей очереди некогда.
+struct Saving {
+    seq: u64,
+    done: Arc<Mutex<Option<SaveDone>>>,
+    job: Shared<Task<()>>,
+}
+
+/// Чем кончилось сохранение копии файла.
+struct SaveDone {
+    file: OpenFile,
+    /// По какую правку включительно сохранено.
+    edits: u64,
+    result: bolh_core::Result<SaveOutcome>,
+}
+
+/// Сохраняет копию открытого файла — годится для другого потока.
+fn save_copy(space: &Space, mut file: OpenFile, edits: u64, conflict_label: &str) -> SaveDone {
+    let result = space.save(&mut file, conflict_label, Clock::system());
+    SaveDone {
+        file,
+        edits,
+        result,
+    }
+}
+
+fn conflict_label(cx: &App) -> String {
+    crate::i18n::current(cx).t("names.conflict").to_string()
 }
 
 impl OpenTab {
     pub fn canvas_view(&self) -> Option<&Entity<CanvasView>> {
         self.canvas.as_ref()
+    }
+
+    /// Есть правки, которых ещё нет на диске.
+    pub fn unsaved(&self) -> bool {
+        self.edits != self.saved_edits
+    }
+
+    /// Файл со всеми правками — то, что пора записать, и номер последней
+    /// правки в нём.
+    fn draft(&mut self, cx: &App) -> (OpenFile, u64) {
+        if let Some(view) = &self.canvas {
+            self.file.content = Content::Canvas(view.read(cx).canvas());
+        }
+        (self.file.clone(), self.edits)
     }
 
     pub fn title(&self) -> String {
@@ -100,6 +162,14 @@ pub struct Workspace {
     pub update: UpdateStatus,
     focus_handle: FocusHandle,
     update_task: Option<Task<()>>,
+    /// Номер последнего начатого сохранения — чтобы итог старого не принять
+    /// за итог нового.
+    save_seq: u64,
+    /// Проверка файлов на чужие правки идёт в фоне — вторую не начинать.
+    polling: bool,
+    /// Меняется при каждом перечитывании дерева здесь же. Дерево из фоновой
+    /// проверки, начатой раньше, устарело: в нём нет только что созданного.
+    tree_version: u64,
     _poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -151,6 +221,9 @@ impl Workspace {
             update: UpdateStatus::Idle,
             focus_handle: cx.focus_handle(),
             update_task: None,
+            save_seq: 0,
+            polling: false,
+            tree_version: 0,
             _poll: None,
             _subscriptions: subscriptions,
         };
@@ -426,12 +499,19 @@ impl Workspace {
 
     // ---- Дерево файлов --------------------------------------------------
 
-    /// Перечитывает дерево с диска, сохраняя раскрытые папки и выбор.
+    /// Перечитывает дерево с диска сейчас же — после своих правок: новый
+    /// файл должен появиться в дереве сразу, а не через две секунды.
     pub fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        self.tree_version += 1;
         let entries = match &self.space {
             Some(s) => s.tree().unwrap_or_default(),
             None => Vec::new(),
         };
+        self.set_tree(entries, cx);
+    }
+
+    /// Показывает дерево, сохраняя раскрытые папки и выбор.
+    fn set_tree(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
         if entries == self.tree && !entries.is_empty() {
             return;
         }
@@ -560,11 +640,8 @@ impl Workspace {
                 subscriptions.push(cx.subscribe_in(
                     &view,
                     window,
-                    move |this, view, ev, window, cx| match ev {
-                        CanvasEvent::Changed => {
-                            let canvas = view.read(cx).canvas().clone();
-                            this.on_canvas_edited(id, canvas, window, cx);
-                        }
+                    move |this, _, ev, window, cx| match ev {
+                        CanvasEvent::Changed => this.on_canvas_edited(id, window, cx),
                     },
                 ));
                 Some(view)
@@ -577,7 +654,11 @@ impl Workspace {
             editor,
             canvas,
             external_noticed: false,
+            edits: 0,
+            saved_edits: 0,
             autosave: None,
+            saving: None,
+            save_again: false,
             _subscriptions: subscriptions,
         });
         let ix = self.tabs.len() - 1;
@@ -617,23 +698,20 @@ impl Workspace {
             return;
         }
         doc.set_plain_text(text);
-        cx.notify();
-        Self::schedule_autosave(tab, window, cx);
+        Self::edited(tab, window, cx);
     }
 
-    fn on_canvas_edited(
-        &mut self,
-        id: u64,
-        canvas: bolh_core::format::Canvas,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
-            return;
-        };
-        tab.file.content = Content::Canvas(canvas);
-        cx.notify();
+    fn on_canvas_edited(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            Self::edited(tab, window, cx);
+        }
+    }
+
+    /// Во вкладке правка: запомнить и сохранить, когда человек остановится.
+    fn edited(tab: &mut OpenTab, window: &mut Window, cx: &mut Context<Self>) {
+        tab.edits += 1;
         Self::schedule_autosave(tab, window, cx);
+        cx.notify();
     }
 
     fn schedule_autosave(tab: &mut OpenTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -660,25 +738,129 @@ impl Workspace {
         }
     }
 
-    /// Сохраняет вкладку через ядро. Ядро само решает, не было ли чужой
-    /// правки, и при расхождении сохраняет обе версии.
+    /// Начинает сохранение вкладки в фоне: запись на диск, особенно в
+    /// облачную папку, бывает долгой, и окно не должно её ждать. Ядро само
+    /// решает, не было ли чужой правки, и при расхождении сохраняет обе
+    /// версии.
     pub fn save_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(space) = &self.space else { return };
+        let Some(space) = self.space.clone() else {
+            return;
+        };
+        let label = conflict_label(cx);
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
             return;
         };
-        if !tab.file.is_dirty() || !tab.file.content.is_writable() {
+        if !tab.unsaved() || !tab.file.content.is_writable() {
             return;
         }
-        let label = crate::i18n::current(cx).t("names.conflict").to_string();
-        let name = tab.title();
-        match space.save(&mut tab.file, &label, Self::clock()) {
-            Ok(SaveOutcome::Saved) => {
-                tab.external_noticed = false;
-                self.status = tr(cx, "sync.saved");
+        if tab.saving.is_some() {
+            tab.save_again = true;
+            return;
+        }
+        let (file, edits) = tab.draft(cx);
+        let done = Arc::new(Mutex::new(None));
+        let slot = done.clone();
+        let job = cx
+            .background_spawn(async move {
+                let saved = save_copy(&space, file, edits, &label);
+                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(saved);
+            })
+            .shared();
+        self.save_seq += 1;
+        let seq = self.save_seq;
+        let wait = job.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            wait.await;
+            let _ = this.update_in(cx, |this, window, cx| this.finish_save(id, seq, window, cx));
+        })
+        .detach();
+        tab.saving = Some(Saving { seq, done, job });
+    }
+
+    /// Фоновое сохранение кончилось. Итог мог уже забрать `flush_tab`.
+    fn finish_save(&mut self, id: u64, seq: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if tab.saving.as_ref().map(|s| s.seq) != Some(seq) {
+            return;
+        }
+        let saving = tab.saving.take().expect("проверено выше");
+        let again = std::mem::take(&mut tab.save_again);
+        let done = saving
+            .done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(done) = done {
+            self.apply_save(id, done, window, cx);
+        }
+        if again {
+            self.save_tab(id, window, cx);
+        }
+    }
+
+    /// Сохраняет вкладку сейчас же и ждёт записи — перед закрытием окна или
+    /// вкладки, переименованием, удалением, сменой пространства. Если
+    /// сохранение уже идёт в фоне, сначала дождаться его: иначе два
+    /// писателя одного файла приняли бы запись друг друга за чужую.
+    pub fn flush_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        tab.autosave = None;
+        tab.save_again = false;
+        if let Some(saving) = tab.saving.take() {
+            cx.foreground_executor().clone().block_on(saving.job);
+            let done = saving
+                .done
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(done) = done {
+                self.apply_save(id, done, window, cx);
             }
+        }
+        let Some(space) = self.space.clone() else {
+            return;
+        };
+        let label = conflict_label(cx);
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if !tab.unsaved() || !tab.file.content.is_writable() {
+            return;
+        }
+        let (file, edits) = tab.draft(cx);
+        let done = save_copy(&space, file, edits, &label);
+        self.apply_save(id, done, window, cx);
+    }
+
+    /// Принимает итог сохранения во вкладку.
+    fn apply_save(&mut self, id: u64, done: SaveDone, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        let name = tab.title();
+        let SaveDone {
+            file,
+            edits,
+            result,
+        } = done;
+        tab.file.adopt_saved(file);
+        // У холста id живёт в редакторе: после расхождения у копии он новый,
+        // и следующее сохранение не должно вернуть копии чужой id.
+        if let Some(view) = &tab.canvas {
+            let new_id = tab.file.content.id();
+            view.update(cx, |v, _| v.set_canvas_id(new_id));
+        }
+        if result.is_ok() {
+            tab.saved_edits = tab.saved_edits.max(edits);
+            tab.external_noticed = false;
+        }
+        match result {
+            Ok(SaveOutcome::Saved) => self.status = tr(cx, "sync.saved"),
             Ok(SaveOutcome::Conflict { copy, .. }) => {
-                tab.external_noticed = false;
                 let copy = copy
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -698,10 +880,11 @@ impl Workspace {
         }
     }
 
+    /// Сохраняет все вкладки и ждёт записи.
     pub fn save_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
         for id in ids {
-            self.save_tab(id, window, cx);
+            self.flush_tab(id, window, cx);
         }
     }
 
@@ -709,7 +892,7 @@ impl Workspace {
         let Some(id) = self.tabs.get(ix).map(|t| t.id) else {
             return;
         };
-        self.save_tab(id, window, cx);
+        self.flush_tab(id, window, cx);
         self.tabs.remove(ix);
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
@@ -726,15 +909,76 @@ impl Workspace {
     }
 
     /// Проверяет открытые файлы и дерево на правки, пришедшие снаружи.
+    /// Чтение диска — в фоне: в облачной папке с тысячами файлов обход
+    /// дерева раз в две секунды заметно подтормаживал окно.
     pub fn poll_external(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(space) = &self.space else { return };
+        if self.polling {
+            return;
+        }
+        let Some(space) = self.space.clone() else {
+            return;
+        };
+        // Файл, который сейчас сохраняется, проверять бессмысленно: на
+        // диске вот-вот будет своя же запись.
+        let probes: Vec<(u64, Probe)> = self
+            .tabs
+            .iter()
+            .filter(|t| t.saving.is_none())
+            .map(|t| (t.id, t.file.probe()))
+            .collect();
+        let tree_version = self.tree_version;
+        self.polling = true;
+        let job = cx.background_spawn(async move {
+            let checks: Vec<(u64, Probe, External)> = probes
+                .into_iter()
+                .map(|(id, probe)| {
+                    let found = space.check(&probe);
+                    (id, probe, found)
+                })
+                .collect();
+            let tree = space.tree();
+            (space, checks, tree)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (space, checks, tree) = job.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.polling = false;
+                this.apply_poll(&space, tree_version, checks, tree, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Применяет то, что нашла фоновая проверка, — кроме устаревшего.
+    fn apply_poll(
+        &mut self,
+        polled: &Space,
+        tree_version: u64,
+        checks: Vec<(u64, Probe, External)>,
+        tree: bolh_core::Result<Vec<Entry>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Пока шла проверка, открыли другое пространство.
+        let Some(space) = self.space.as_ref().filter(|s| s.root() == polled.root()) else {
+            return;
+        };
         let mut notes: Vec<(NotificationType, SharedString)> = Vec::new();
-        for tab in &mut self.tabs {
+        for (id, probe, found) in checks {
+            let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+                continue;
+            };
+            // Пока шла проверка, файл сохранили, перечитали или
+            // переименовали: ответ про прежний файл, и своя же запись
+            // показалась бы чужой.
+            if tab.saving.is_some() || !tab.file.is_current(&probe) {
+                continue;
+            }
             let name = tab.title();
-            match space.check_external(&tab.file) {
+            match found {
                 External::Unchanged | External::Unreadable(_) => {}
                 External::Changed(content, bytes) => {
-                    if tab.file.is_dirty() {
+                    if tab.unsaved() {
                         if !tab.external_noticed {
                             tab.external_noticed = true;
                             notes.push((
@@ -765,7 +1009,9 @@ impl Workspace {
         for (kind, text) in notes {
             self.notify(kind, text, false, window, cx);
         }
-        self.refresh_tree(cx);
+        if self.tree_version == tree_version {
+            self.set_tree(tree.unwrap_or_default(), cx);
+        }
     }
 
     // ---- Переименование и корзина ---------------------------------------
@@ -1040,13 +1286,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Сначала дописать правки: откат кладёт нынешнее состояние в
+        // историю, и оно должно быть полным; и запись не должна столкнуться
+        // с фоновым сохранением.
+        self.flush_tab(tab_id, window, cx);
         let Some(space) = &self.space else { return };
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
             return;
         };
-        let label = crate::i18n::current(cx).t("names.conflict").to_string();
+        let label = conflict_label(cx);
         match space.restore_snapshot(&mut tab.file, snap, &label, Self::clock()) {
             Ok(_) => {
+                tab.saved_edits = tab.edits;
                 Self::show_file_content(tab, window, cx);
                 let text = trf(cx, "history.restored", &[("time", when)]);
                 self.notify(NotificationType::Success, text, false, window, cx);
@@ -1483,7 +1734,7 @@ impl Workspace {
             .on_click(cx.listener(|this, ix: &usize, window, cx| this.activate(*ix, window, cx)))
             .children(self.tabs.iter().enumerate().map(|(ix, t)| {
                 let w = weak.clone();
-                let dirty = t.file.is_dirty();
+                let dirty = t.unsaved();
                 Tab::new()
                     .label(t.title())
                     .prefix(Icon::new(file_icon(&t.file.rel)).small())

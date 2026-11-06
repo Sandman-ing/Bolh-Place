@@ -18,6 +18,9 @@ bolh-core = { path = "../bolh-core" }
 gpui-kit.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dirs = "6.0.0"
+# Общий итог фонового сохранения: его ждут и обычный ход событий, и
+# закрытие окна.
+futures = "0.3.34"
 semver = "1.0.28"
 serde_json = "1.0.154"
 sys-locale = "0.3.2"

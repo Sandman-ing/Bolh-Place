@@ -5,7 +5,6 @@
 //! вкладка кладёт их в файл и сохраняет через ядро.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use bolh_core::canvas::{self, Editor, Guide, Point, Rect, View};
@@ -34,6 +33,20 @@ const SNAP_SCREEN_PX: f64 = 6.0;
 const HANDLE_PX: f64 = 10.0;
 /// Масштаб за один щелчок колеса.
 const WHEEL_ZOOM: f64 = 1.1;
+/// Мельче этого масштаба текст карточек не читается (мельче 6 точек), и
+/// холст рисуется «обзором»: все карточки одним проходом, без раскладки.
+/// Так 5000 объектов, видимые разом, укладываются в кадр.
+const OVERVIEW_ZOOM: f64 = 0.35;
+/// Сетка не гуще этого числа точек на экране: каждая точка — отдельная
+/// фигура, и тысячи их съедали кадр.
+const GRID_MAX_DOTS: f64 = 1500.0;
+/// Рамка карточки в точках экрана — как у `.border_1()`. Изнутри карточки
+/// её не видно, а мерить нужно всю высоту: иначе мерка всегда на две точки
+/// меньше настоящей, и окно перерисовывалось бы без конца.
+const CARD_BORDER_PX: f64 = 1.0;
+/// Мельче этого масштаба полоски текста в обзоре тоньше полутора точек —
+/// не видны, а фигур втрое больше.
+const OVERVIEW_TEXT_ZOOM: f64 = 0.15;
 
 gpui_kit::actions!(
     canvas,
@@ -154,9 +167,10 @@ pub struct CanvasView {
     /// Поставить фокус в поле текста при следующей отрисовке. Сразу нельзя:
     /// щелчок по холсту после нашего обработчика забирает фокус себе.
     focus_editing: bool,
-    /// Высота карточек после раскладки, в точках холста: длинный текст
-    /// делает карточку выше заданной.
-    measured: Rc<RefCell<HashMap<String, f64>>>,
+    /// Высоты карточек после раскладки, в точках холста: длинный текст
+    /// делает карточку выше заданной. Собираются при раскладке кадра и
+    /// передаются ядру в начале следующего — только для показа и мыши.
+    measured: Rc<RefCell<Vec<(String, f64)>>>,
     /// Где на экране поле: нужно, чтобы перевести точку окна в точку холста.
     bounds: Rc<Cell<Bounds<Pixels>>>,
     focus_handle: FocusHandle,
@@ -187,42 +201,10 @@ impl CanvasView {
             editing: None,
             read_only,
             focus_editing: false,
-            measured: Rc::new(RefCell::new(HashMap::new())),
+            measured: Rc::new(RefCell::new(Vec::new())),
             bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle: cx.focus_handle(),
         }
-    }
-
-    /// Высота, которую карточка заняла на экране в прошлый раз.
-    fn shown_height(&self, id: &str) -> f64 {
-        self.measured.borrow().get(id).copied().unwrap_or(0.0)
-    }
-
-    /// Карточки, которые текст сделал выше заданного, получают эту высоту
-    /// в файле: иначе выделение, уголки и прилипание считались бы по
-    /// старой высоте. Только рост: размер, заданный руками, не уменьшается.
-    fn apply_measured_heights(&mut self, cx: &mut Context<Self>) {
-        let grown: Vec<(String, f64)> = self
-            .measured
-            .borrow()
-            .iter()
-            .filter_map(|(id, h)| {
-                let n = self.editor.node(id)?;
-                (*h > n.height + 0.5).then(|| (id.clone(), h.round()))
-            })
-            .collect();
-        if grown.is_empty() {
-            return;
-        }
-        for (id, h) in grown {
-            if let Some(n) = self.editor.node(&id) {
-                let r = Rect { h, ..Rect::of(n) };
-                self.editor.set_rect(&id, r);
-            }
-        }
-        // Без отдельного шага отмены: рост — следствие текста, и отмена
-        // текста вернёт и высоту.
-        cx.emit(CanvasEvent::Changed);
     }
 
     pub fn editor(&self) -> &Editor {
@@ -233,12 +215,18 @@ impl CanvasView {
         self.view
     }
 
-    pub fn canvas(&self) -> &Canvas {
-        self.editor.canvas()
+    /// Холст со всеми правками — для сохранения.
+    pub fn canvas(&self) -> Canvas {
+        self.editor.to_canvas()
     }
 
     pub fn is_editing(&self) -> bool {
         self.editing.is_some()
+    }
+
+    /// После расхождения холст живёт копией со своим id.
+    pub fn set_canvas_id(&mut self, id: bolh_core::Uuid) {
+        self.editor.set_id(id);
     }
 
     /// Пришла версия из облака: показать её, сбросив отмену.
@@ -282,7 +270,7 @@ impl CanvasView {
             return None;
         }
         let id = &self.editor.selection()[0];
-        let r = Rect::of(self.editor.node(id)?);
+        let r = self.editor.rect_of(id)?;
         let a = self.view.to_screen(Point { x: r.x, y: r.y });
         let b = self.view.to_screen(Point {
             x: r.right(),
@@ -381,6 +369,17 @@ impl CanvasView {
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let local = self.local(ev.position);
         let world = self.view.to_world(local);
+        // К чему прилипать — только видимые соседи; Alt — без прилипания.
+        let snapping = !ev.modifiers.alt
+            && matches!(self.gesture, Gesture::Move { .. } | Gesture::Resize { .. });
+        let threshold = SNAP_SCREEN_PX / self.view.zoom;
+        let grid = self.grid_step();
+        let others = if snapping {
+            let (w, h) = self.size();
+            self.editor.unselected_rects_in(self.view.visible(w, h))
+        } else {
+            Vec::new()
+        };
         match &mut self.gesture {
             Gesture::None => return,
             Gesture::Pan { last } => {
@@ -401,13 +400,10 @@ impl CanvasView {
                     y: start_bounds.y + raw.1,
                     ..*start_bounds
                 };
-                let threshold = SNAP_SCREEN_PX / self.view.zoom;
-                let others = self.editor.unselected_rects();
-                // Alt — двигать свободно, без прилипания.
-                let s = if ev.modifiers.alt {
-                    canvas::Snap::default()
+                let s = if snapping {
+                    canvas::snap(moved, &others, grid, threshold)
                 } else {
-                    canvas::snap(moved, &others, self.grid.then_some(canvas::GRID), threshold)
+                    canvas::Snap::default()
                 };
                 let total = (raw.0 + s.dx, raw.1 + s.dy);
                 let step = (total.0 - applied.0, total.1 - applied.1);
@@ -430,29 +426,46 @@ impl CanvasView {
                     2 => (r, b) = (r + dx, b + dy),
                     _ => (l, b) = (l + dx, b + dy),
                 }
-                if self.grid {
-                    let g = canvas::GRID;
-                    let snap = |v: f64| (v / g).round() * g;
-                    (l, t, r, b) = (snap(l), snap(t), snap(r), snap(b));
+                // Тянущиеся края мягко прилипают к соседям и линиям сетки,
+                // вдали от них — идут точно за мышью. Alt — без прилипания.
+                let left_moves = matches!(corner, 0 | 3);
+                let top_moves = matches!(corner, 0 | 1);
+                let edge_x = if left_moves { l } else { r };
+                let edge_y = if top_moves { t } else { b };
+                let id = id.clone();
+                self.guides.clear();
+                if snapping {
+                    let s =
+                        canvas::snap_edges(Some(edge_x), Some(edge_y), &others, grid, threshold);
+                    if left_moves {
+                        l += s.dx
+                    } else {
+                        r += s.dx
+                    }
+                    if top_moves {
+                        t += s.dy
+                    } else {
+                        b += s.dy
+                    }
+                    self.guides = s.guides;
                 }
                 // Уголок перетащили за противоположный — держим минимум,
                 // прижимая к неподвижной стороне.
                 let (min_w, min_h) = canvas::MIN_SIZE;
                 if r - l < min_w {
-                    if matches!(corner, 0 | 3) {
+                    if left_moves {
                         l = r - min_w
                     } else {
                         r = l + min_w
                     }
                 }
                 if b - t < min_h {
-                    if matches!(corner, 0 | 1) {
+                    if top_moves {
                         t = b - min_h
                     } else {
                         b = t + min_h
                     }
                 }
-                let id = id.clone();
                 self.editor.set_rect(
                     &id,
                     Rect {
@@ -635,7 +648,7 @@ impl CanvasView {
             .editor
             .nodes()
             .iter()
-            .map(Rect::of)
+            .map(|n| self.editor.rect(n))
             .reduce(|a, b| a.union(&b));
         match all {
             Some(r) if w > 0.0 => self.view.fit(r, w, h),
@@ -753,7 +766,11 @@ impl Render for CanvasView {
                 self.zoom_fit(cx);
             }
         }
-        self.apply_measured_heights(cx);
+        // Высоты, которые карточки заняли в прошлом кадре, — ядру: по ним
+        // попадание мышью, уголки и прилипание.
+        for (id, h) in self.measured.borrow_mut().drain(..) {
+            self.editor.set_shown_height(&id, h);
+        }
         if self.focus_editing {
             self.focus_editing = false;
             if let Some((_, state, _)) = &self.editing {
@@ -764,7 +781,8 @@ impl Render for CanvasView {
         let zoom = view.zoom;
         let visible = view.visible(w.max(1.0), h.max(1.0));
 
-        // Сетка: точки в узлах, реже при мелком масштабе, чтобы не рябило.
+        // Сетка: точки в узлах. При мелком масштабе и на большом экране —
+        // через узел, чтобы точек было не больше GRID_MAX_DOTS.
         let bounds_cell = self.bounds.clone();
         let grid_color = theme.border;
         let show_grid = self.grid;
@@ -774,124 +792,208 @@ impl Render for CanvasView {
                 if !show_grid {
                     return;
                 }
+                let (bw, bh) = (f(bounds.size.width), f(bounds.size.height));
                 let mut step = canvas::GRID * zoom;
-                while step < 12.0 {
+                while step < 16.0 || (bw / step) * (bh / step) > GRID_MAX_DOTS {
                     step *= 2.0;
                 }
                 let ox = f(bounds.origin.x);
                 let oy = f(bounds.origin.y);
-                let (bw, bh) = (f(bounds.size.width), f(bounds.size.height));
                 let start_x = view.offset_x.rem_euclid(step);
                 let start_y = view.offset_y.rem_euclid(step);
                 let dot = (1.5 * zoom.clamp(0.75, 1.5)) as f32;
-                let mut y = start_y;
-                while y < bh {
-                    let mut x = start_x;
-                    while x < bw {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(px((ox + x) as f32), px((oy + y) as f32)),
-                                size(px(dot), px(dot)),
-                            ),
-                            grid_color,
-                        ));
-                        x += step;
+                // Одним слоем: иначе каждая точка отдельно ищет своё место
+                // в порядке рисования, а точек сотни.
+                window.paint_layer(bounds, |window| {
+                    let mut y = start_y;
+                    while y < bh {
+                        let mut x = start_x;
+                        while x < bw {
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(px((ox + x) as f32), px((oy + y) as f32)),
+                                    size(px(dot), px(dot)),
+                                ),
+                                grid_color,
+                            ));
+                            x += step;
+                        }
+                        y += step;
                     }
-                    y += step;
-                }
+                });
             },
         )
         .absolute()
         .size_full();
 
         let editing_id = self.editing.as_ref().map(|(id, ..)| id.clone());
+        let overview = zoom < OVERVIEW_ZOOM && editing_id.is_none();
         let text_px = (16.0 * zoom) as f32;
-        let cards = self
-            .editor
-            .nodes()
-            .iter()
-            .filter(|n| Rect::of(n).intersects(&visible))
-            .map(|n| {
-                let s = view.to_screen(Point { x: n.x, y: n.y });
-                let selected = self.editor.is_selected(&n.id);
-                let editing = editing_id.as_deref() == Some(n.id.as_str());
-                let mut card = div()
-                    .id(SharedString::from(format!("node:{}", n.id)))
-                    .test_support()
-                    .absolute()
-                    .left(px(s.x as f32))
-                    .top(px(s.y as f32))
-                    .w(px((n.width * zoom) as f32))
-                    // Высота — не меньше заданной, а длинный текст растит
-                    // карточку: её меряем после раскладки и запоминаем.
-                    .min_h(px((n.height * zoom) as f32))
-                    .rounded(px((16.0 * zoom) as f32))
-                    .bg(theme.popover)
-                    // Рамка одной толщины всегда: выделение рисуется отдельным
-                    // контуром снаружи, и текст не сдвигается.
-                    .border_1()
-                    .border_color(theme.input)
-                    .p(px((12.0 * zoom) as f32))
-                    .text_size(px(text_px))
-                    .line_height(px(text_px * 1.375))
-                    .text_color(theme.foreground);
-                if editing && let Some((_, state, _)) = &self.editing {
-                    // Тот же шрифт, что и без правки, — текст не прыгает.
-                    card = card.child(
-                        Textarea::new(state)
-                            .bordered(false)
-                            .appearance(false)
-                            // Без своего фона поле не рисуется вовсе — текст
-                            // при наборе было не видно.
-                            .bg(theme.popover)
-                            .text_color(theme.foreground)
-                            // Самый маленький размер поля — с минимальными
-                            // внутренними отступами (4 слева и справа), их и
-                            // гасим, чтобы текст стоял там же, где без правки.
-                            .xsmall()
-                            .mx(px(-4.))
-                            .p_0()
-                            .text_size(px(text_px))
-                            .line_height(px(text_px * 1.375)),
-                    );
-                } else if text_px >= 4.0 {
-                    card = card.child(n.text.clone());
-                }
-                let measured = self.measured.clone();
-                let id = n.id.clone();
-                card = card.child(
-                    paint_canvas(
-                        move |b, _, _| {
-                            measured.borrow_mut().insert(id, f(b.size.height) / zoom);
-                        },
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .size_full(),
-                );
-                let ring = selected.then(|| {
-                    div()
+        let radius = px((16.0 * zoom) as f32);
+
+        // Обзор: все видимые карточки — прямоугольники одним проходом, текст
+        // — полосками. Ни одного элемента раскладки на карточку.
+        let overview_layer = overview.then(|| {
+            let with_text = zoom >= OVERVIEW_TEXT_ZOOM;
+            let shapes: Vec<(Rect, bool, usize)> = self
+                .editor
+                .nodes()
+                .iter()
+                .map(|n| (n, self.editor.rect(n)))
+                .filter(|(_, r)| r.intersects(&visible))
+                .map(|(n, r)| {
+                    let lines = if with_text {
+                        n.text.chars().count().div_ceil(24).min(3)
+                    } else {
+                        0
+                    };
+                    (r, self.editor.is_selected(&n.id), lines)
+                })
+                .collect();
+            let (card_bg, card_border, bar, ring) =
+                (theme.popover, theme.input, theme.muted, theme.primary);
+            paint_canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let (ox, oy) = (f(bounds.origin.x), f(bounds.origin.y));
+                    // Все карточки обзора — одним слоем: порядок рисования
+                    // ищется один раз, а не для каждой из тысяч фигур.
+                    window.paint_layer(bounds, |window| {
+                        for (r, selected, lines) in &shapes {
+                            let a = view.to_screen(Point { x: r.x, y: r.y });
+                            let rect = Bounds::new(
+                                point(px((ox + a.x) as f32), px((oy + a.y) as f32)),
+                                size(px((r.w * zoom) as f32), px((r.h * zoom) as f32)),
+                            );
+                            window.paint_quad(
+                                fill(rect, card_bg)
+                                    .corner_radii(radius)
+                                    .border_widths(px(if *selected { 2. } else { 1. }))
+                                    .border_color(if *selected { ring } else { card_border }),
+                            );
+                            let pad = 12.0 * zoom;
+                            for k in 0..*lines {
+                                let width =
+                                    (r.w - 24.0) * zoom * if k + 1 == *lines { 0.6 } else { 0.9 };
+                                let line = Bounds::new(
+                                    point(
+                                        px((ox + a.x + pad) as f32),
+                                        px((oy + a.y + pad + k as f64 * 22.0 * zoom) as f32),
+                                    ),
+                                    size(px(width.max(0.0) as f32), px((10.0 * zoom) as f32)),
+                                );
+                                window.paint_quad(
+                                    fill(line, bar).corner_radii(px((3.0 * zoom) as f32)),
+                                );
+                            }
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
+        });
+
+        let cards = if overview {
+            Vec::new()
+        } else {
+            self.editor
+                .nodes()
+                .iter()
+                .filter(|n| self.editor.rect(n).intersects(&visible))
+                .map(|n| {
+                    let s = view.to_screen(Point { x: n.x, y: n.y });
+                    let selected = self.editor.is_selected(&n.id);
+                    let editing = editing_id.as_deref() == Some(n.id.as_str());
+                    let mut card = div()
+                        .id(SharedString::from(format!("node:{}", n.id)))
+                        .test_support()
                         .absolute()
-                        .left(px((s.x - 2.0) as f32))
-                        .top(px((s.y - 2.0) as f32))
-                        .w(px((n.width * zoom + 4.0) as f32))
-                        .h(px(
-                            (n.height.max(self.shown_height(&n.id)) * zoom + 4.0) as f32
-                        ))
-                        .rounded(px((16.0 * zoom + 2.0) as f32))
-                        .border_2()
-                        .border_color(theme.primary)
-                });
-                div().child(card).children(ring)
-            })
-            .collect::<Vec<_>>();
+                        .left(px(s.x as f32))
+                        .top(px(s.y as f32))
+                        .w(px((n.width * zoom) as f32))
+                        // Высота — не меньше заданной; длинный текст растит
+                        // карточку на экране, а в файле остаётся заданная.
+                        .min_h(px((n.height * zoom) as f32))
+                        .rounded(radius)
+                        .bg(theme.popover)
+                        // Рамка одной толщины всегда: выделение рисуется
+                        // отдельным контуром снаружи, и текст не сдвигается.
+                        .border_1()
+                        .border_color(theme.input)
+                        .p(px((12.0 * zoom) as f32))
+                        .text_size(px(text_px))
+                        .line_height(px(text_px * 1.375))
+                        .text_color(theme.foreground);
+                    if editing && let Some((_, state, _)) = &self.editing {
+                        // Тот же шрифт, что и без правки, — текст не прыгает.
+                        card = card.child(
+                            Textarea::new(state)
+                                .bordered(false)
+                                .appearance(false)
+                                // Без своего фона поле не рисуется вовсе.
+                                .bg(theme.popover)
+                                .text_color(theme.foreground)
+                                // Самый маленький размер поля — с минимальными
+                                // внутренними отступами (4 слева и справа), их
+                                // и гасим, чтобы текст стоял там же, где без
+                                // правки.
+                                .xsmall()
+                                .mx(px(-4.))
+                                .p_0()
+                                .text_size(px(text_px))
+                                .line_height(px(text_px * 1.375)),
+                        );
+                    } else if !n.text.is_empty() {
+                        card = card.child(n.text.clone());
+                    }
+                    // Мерить нужно только карточки с текстом: без текста
+                    // высота на экране и в файле совпадают.
+                    if editing || !n.text.is_empty() {
+                        let measured = self.measured.clone();
+                        let id = n.id.clone();
+                        let known = self.editor.rect(n).h;
+                        card = card.child(
+                            paint_canvas(
+                                move |b, window, _| {
+                                    let h = (f(b.size.height) + 2.0 * CARD_BORDER_PX) / zoom;
+                                    // Высота поменялась — нужен ещё кадр, чтобы
+                                    // уголки и выделение встали по ней. Просто
+                                    // `refresh` во время отрисовки не действует.
+                                    if (h - known).abs() > 0.5 {
+                                        window.request_animation_frame();
+                                    }
+                                    measured.borrow_mut().push((id, h));
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        );
+                    }
+                    if selected {
+                        card = card.child(
+                            div()
+                                .absolute()
+                                .top(px(-3.))
+                                .left(px(-3.))
+                                .right(px(-3.))
+                                .bottom(px(-3.))
+                                .rounded(radius + px(2.))
+                                .border_2()
+                                .border_color(theme.primary),
+                        );
+                    }
+                    card
+                })
+                .collect::<Vec<_>>()
+        };
 
         // Уголки для изменения размера у одного выделенного объекта.
         let handles = (self.editor.selection().len() == 1 && editing_id.is_none())
-            .then(|| self.editor.node(&self.editor.selection()[0]))
+            .then(|| self.editor.rect_of(&self.editor.selection()[0]))
             .flatten()
-            .map(|n| {
-                let r = Rect::of(n);
+            .map(|r| {
                 let a = view.to_screen(Point { x: r.x, y: r.y });
                 let b = view.to_screen(Point {
                     x: r.right(),
@@ -1090,6 +1192,7 @@ impl Render for CanvasView {
                 .item(PopupMenuItem::new(tr(cx, "common.delete")).action(Box::new(Delete)))
             })
             .child(grid)
+            .children(overview_layer)
             .children(cards)
             .children(handles)
             .children(guides)

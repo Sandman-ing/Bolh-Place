@@ -324,6 +324,94 @@ fn simultaneous_edit_keeps_both_versions() {
 }
 
 #[test]
+fn save_of_a_copy_keeps_edits_made_meanwhile() {
+    // Интерфейс сохраняет копию файла в другом потоке, а человек тем
+    // временем печатает дальше.
+    let (_d, s) = new_space();
+    let rel = s
+        .create_file(Path::new(""), "Д", FileKind::Document, clock(0))
+        .unwrap();
+    let mut f = s.open_file(&rel).unwrap();
+    set_text(&mut f, "один");
+    let mut copy = f.clone();
+    set_text(&mut f, "один два");
+    assert_eq!(
+        s.save(&mut copy, "к", clock(1)).unwrap(),
+        SaveOutcome::Saved
+    );
+    f.adopt_saved(copy);
+    assert_eq!(text(&s, &rel), "один", "на диске — то, что было на начало");
+    assert!(
+        f.is_dirty(),
+        "правка, сделанная во время сохранения, осталась"
+    );
+    // Своя же запись не принята за чужую: следующее сохранение — без копии.
+    assert!(matches!(s.check_external(&f), External::Unchanged));
+    assert_eq!(s.save(&mut f, "к", clock(2)).unwrap(), SaveOutcome::Saved);
+    assert_eq!(text(&s, &rel), "один два");
+}
+
+#[test]
+fn conflict_found_while_saving_a_copy_moves_the_file_to_it() {
+    let (_d, s) = new_space();
+    let rel = s
+        .create_file(Path::new(""), "План", FileKind::Document, clock(0))
+        .unwrap();
+    let mut f = s.open_file(&rel).unwrap();
+    let original_id = f.content.id();
+    set_text(&mut f, "моё");
+    edit_elsewhere(&s, &rel, "чужое");
+    let mut copy = f.clone();
+    set_text(&mut f, "моё ещё");
+    let out = s.save(&mut copy, "расхождение", clock(3)).unwrap();
+    let SaveOutcome::Conflict { copy: copy_rel, .. } = out else {
+        panic!("ожидалось расхождение")
+    };
+    f.adopt_saved(copy);
+    assert_eq!(f.rel, copy_rel, "дальше файл — копия");
+    assert_ne!(f.content.id(), original_id, "у копии своя история");
+    assert_eq!(
+        s.save(&mut f, "расхождение", clock(4)).unwrap(),
+        SaveOutcome::Saved
+    );
+    assert_eq!(text(&s, &copy_rel), "моё ещё");
+    assert_eq!(text(&s, &rel), "чужое", "чужое не тронуто");
+    assert_eq!(s.open_file(&copy_rel).unwrap().content.id(), f.content.id());
+}
+
+#[test]
+fn probe_goes_stale_when_the_file_is_saved_reread_or_renamed() {
+    let (_d, s) = new_space();
+    let rel = s
+        .create_file(Path::new(""), "Д", FileKind::Document, clock(0))
+        .unwrap();
+    let mut f = s.open_file(&rel).unwrap();
+    let probe = f.probe();
+    assert!(f.is_current(&probe));
+    assert!(matches!(s.check(&probe), External::Unchanged));
+
+    set_text(&mut f, "своё");
+    s.save(&mut f, "к", clock(1)).unwrap();
+    assert!(!f.is_current(&probe), "после сохранения проба устарела");
+    // Поэтому её ответ и нельзя применять: своя запись выглядит чужой.
+    assert!(matches!(s.check(&probe), External::Changed(..)));
+    let fresh = f.probe();
+    assert!(f.is_current(&fresh));
+    assert!(matches!(s.check(&fresh), External::Unchanged));
+
+    edit_elsewhere(&s, &rel, "с ноутбука");
+    let External::Changed(c, b) = s.check(&fresh) else {
+        panic!("правка снаружи не замечена")
+    };
+    s.accept_external(&mut f, *c, b);
+    assert!(!f.is_current(&fresh), "после перечитывания тоже");
+
+    let probe = f.probe();
+    f.rel = PathBuf::from("Другое.bdoc");
+    assert!(!f.is_current(&probe), "и после переименования");
+}
+
+#[test]
 fn same_change_on_both_sides_is_not_a_conflict() {
     let (_d, s) = new_space();
     let rel = s

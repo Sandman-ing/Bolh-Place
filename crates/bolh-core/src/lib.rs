@@ -14,3 +14,6 @@ pub mod trash;
 pub mod update;
 
 pub use error::{Error, Result};
+/// id документов и холстов — чтобы интерфейсу не нужна была своя копия
+/// библиотеки.
+pub use uuid::Uuid;

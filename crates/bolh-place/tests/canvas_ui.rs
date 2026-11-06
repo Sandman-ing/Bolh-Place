@@ -154,31 +154,29 @@ fn double_click_creates_card_and_typed_text_is_saved(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn drag_moves_card_with_snapping_and_undo_restores(cx: &mut TestAppContext) {
+fn drag_follows_the_mouse_snaps_near_grid_and_undo_restores(cx: &mut TestAppContext) {
     let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
-    let before = nodes_in_view(cx, &fx)[0].clone();
-    act(cx, &fx, |w, cx| {
-        let b = w.find("node:a").bounds();
-        let from = b.center();
-        w.drag(from, point(from.x + px(53.), from.y + px(27.)), cx);
-    });
-    let moved = &nodes_in_view(cx, &fx)[0];
-    assert_ne!(
-        (moved.x, moved.y),
-        (before.x, before.y),
-        "карточка сдвинулась"
-    );
-    assert_eq!(moved.x % 20.0, 0.0, "прилипла к сетке по x: {}", moved.x);
-    assert_eq!(moved.y % 20.0, 0.0, "прилипла к сетке по y: {}", moved.y);
+    let drag_by = |cx: &mut TestAppContext, dx: f32, dy: f32| {
+        act(cx, &fx, |w, cx| {
+            let from = w.find("node:a").bounds().center();
+            w.drag(from, point(from.x + px(dx), from.y + px(dy)), cx);
+        });
+        let n = &nodes_in_view(cx, &fx)[0];
+        (n.x, n.y)
+    };
+    // Вдали от линий сетки карточка идёт точно за мышью: 53 и 27 — в семи
+    // точках от ближайших линий, дальше порога прилипания.
+    assert_eq!(drag_by(cx, 53., 27.), (53.0, 27.0), "идёт за мышью");
+    // Рядом с линией — прилипает к ней: 58 → 60, 42 → 40.
+    assert_eq!(drag_by(cx, 5., 15.), (60.0, 40.0), "прилипла к сетке");
     act(cx, &fx, |w, cx| w.press("ctrl-z", cx));
-    let back = &nodes_in_view(cx, &fx)[0];
-    assert_eq!(
-        (back.x, back.y),
-        (before.x, before.y),
-        "Ctrl+Z вернул на место"
-    );
+    let n = &nodes_in_view(cx, &fx)[0];
+    assert_eq!((n.x, n.y), (53.0, 27.0), "Ctrl+Z вернул на шаг назад");
+    act(cx, &fx, |w, cx| w.press("ctrl-z", cx));
+    let n = &nodes_in_view(cx, &fx)[0];
+    assert_eq!((n.x, n.y), (0.0, 0.0), "и ещё на шаг");
     act(cx, &fx, |w, cx| w.press("ctrl-y", cx));
-    assert_eq!(nodes_in_view(cx, &fx)[0].x, moved.x, "Ctrl+Y повторил");
+    assert_eq!(nodes_in_view(cx, &fx)[0].x, 53.0, "Ctrl+Y повторил");
 }
 
 #[gpui_kit::test]
@@ -247,7 +245,7 @@ fn wheel_zooms_and_touchpad_pans(cx: &mut TestAppContext) {
     assert_eq!(v2.zoom, v1.zoom, "тачпад не меняет масштаб");
     assert_eq!(v2.offset_y, v1.offset_y - 100.0, "тачпад сдвигает поле");
     // Вид не пишется в файл: прокрутка — не правка.
-    cx.read(|cx| assert!(!fx.ws.read(cx).active_tab().unwrap().file.is_dirty()));
+    cx.read(|cx| assert!(!fx.ws.read(cx).active_tab().unwrap().unsaved()));
 }
 
 #[gpui_kit::test]
@@ -355,15 +353,149 @@ fn plain_click_on_one_of_selected_keeps_only_it(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn long_text_makes_card_taller(cx: &mut TestAppContext) {
+fn long_text_makes_card_taller_on_screen_but_not_in_the_file(cx: &mut TestAppContext) {
     let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
     act(cx, &fx, |w, cx| w.double_click("node:a", cx));
     let long = "очень длинная строка текста ".repeat(12);
     act(cx, &fx, |w, cx| w.input(&long, cx));
     act(cx, &fx, |w, cx| w.press("escape", cx));
     act(cx, &fx, |_, _| {});
-    let h = nodes_in_view(cx, &fx)[0].height;
-    assert!(h > 140.0, "карточка выросла под текст: {h}");
+    let zoom = cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        ws.active_tab()
+            .unwrap()
+            .canvas_view()
+            .unwrap()
+            .read(cx)
+            .view()
+            .zoom
+    });
+    let on_screen = cx
+        .update_window(fx.handle, |_, w, _| w.find("node:a").bounds().size.height)
+        .unwrap();
+    let on_screen = f64::from(f32::from(on_screen)) / zoom;
+    assert!(on_screen > 140.0, "карточка выросла под текст: {on_screen}");
+    // Мышь и выделение знают настоящую высоту.
+    let shown = cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        let v = ws.active_tab().unwrap().canvas_view().unwrap().read(cx);
+        v.editor().rect_of("a").unwrap().h
+    });
+    assert!(
+        (shown - on_screen).abs() < 1.0,
+        "{shown} против {on_screen}"
+    );
+    // В файле — заданная человеком высота: подгонка под текст не правка, и
+    // карточка не растёт сама при каждом открытии.
     save_now(cx, &fx);
-    assert_eq!(nodes_on_disk(&fx)[0].height, h, "высота сохранена");
+    assert_eq!(nodes_on_disk(&fx)[0].height, 140.0);
+    assert_eq!(nodes_on_disk(&fx)[0].text, long);
+}
+
+#[gpui_kit::test]
+fn shrinking_a_card_by_its_corner_works_and_saves_once(cx: &mut TestAppContext) {
+    let mut a = card("a", 0.0, 0.0);
+    a.text = "коротко".into();
+    let fx = open_canvas(cx, vec![a]);
+    let view = cx.read(|cx| {
+        fx.ws
+            .read(cx)
+            .active_tab()
+            .unwrap()
+            .canvas_view()
+            .unwrap()
+            .clone()
+    });
+    let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = changes.clone();
+    let _sub = cx.update(|cx| {
+        cx.subscribe(
+            &view,
+            move |_, _: &bolh_place::canvas_view::CanvasEvent, _| counter.set(counter.get() + 1),
+        )
+    });
+    act(cx, &fx, |w, cx| w.click("node:a", cx));
+    act(cx, &fx, |w, cx| {
+        let b = w.find("node:a").bounds();
+        let corner = point(b.origin.x + b.size.width, b.origin.y + b.size.height);
+        w.drag(corner, point(corner.x, corner.y - px(60.)), cx);
+    });
+    let n = nodes_in_view(cx, &fx)[0].clone();
+    assert_eq!(n.height, 80.0, "карточка уменьшилась вслед за уголком");
+    assert_eq!(
+        changes.get(),
+        1,
+        "одно изменение на всю протяжку, а не на каждый кадр"
+    );
+}
+
+#[gpui_kit::test]
+fn after_a_conflict_the_canvas_copy_keeps_its_own_id(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    let original_id = {
+        let bytes = std::fs::read(fx.root.join(REL)).unwrap();
+        Content::parse(FileKind::Canvas, &bytes, Path::new(REL))
+            .unwrap()
+            .id()
+    };
+    act(cx, &fx, |w, cx| w.press("ctrl-a", cx));
+    act(cx, &fx, |w, cx| w.press("right", cx));
+    // Тем временем на другом компьютере холст поменяли по-своему.
+    let space = Space::open(&fx.root).unwrap();
+    let mut other = space.open_file(Path::new(REL)).unwrap();
+    if let Content::Canvas(c) = &mut other.content {
+        c.nodes.push(card("чужая", 500.0, 0.0));
+    }
+    std::fs::write(fx.root.join(REL), other.content.to_bytes()).unwrap();
+    save_now(cx, &fx);
+    let copy = cx.read(|cx| fx.ws.read(cx).active_tab().unwrap().file.rel.clone());
+    assert_ne!(copy, Path::new(REL), "своё ушло в копию");
+    // Следующая правка — в копию, и у копии остаётся своя история.
+    act(cx, &fx, |w, cx| w.press("right", cx));
+    save_now(cx, &fx);
+    let bytes = std::fs::read(fx.root.join(&copy)).unwrap();
+    let saved = Content::parse(FileKind::Canvas, &bytes, &copy).unwrap();
+    assert_ne!(saved.id(), original_id, "у копии свой id");
+    let Content::Canvas(c) = saved else { panic!() };
+    assert_eq!(c.nodes[0].x, 2.0, "вторая правка тоже в копии");
+}
+
+#[gpui_kit::test]
+fn own_save_during_a_check_is_not_taken_for_a_change_elsewhere(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.press("ctrl-a", cx));
+    act(cx, &fx, |w, cx| w.press("right", cx));
+    // Фоновая проверка уже началась, когда вкладку сохранили — например,
+    // перед переименованием. На диске она найдёт нашу же запись.
+    step(cx, &fx, |ws, window, cx| {
+        ws.poll_external(window, cx);
+        ws.save_all(window, cx);
+    });
+    // Холст не перечитан как «пришедший из облака»: отмена на месте.
+    act(cx, &fx, |w, cx| w.press("ctrl-z", cx));
+    assert_eq!(nodes_in_view(cx, &fx)[0].x, 0.0, "Ctrl+Z работает");
+}
+
+#[gpui_kit::test]
+fn calm_canvas_does_not_redraw_by_itself(cx: &mut TestAppContext) {
+    let mut a = card("a", 0.0, 0.0);
+    a.text = "коротко".into();
+    let mut b = card("b", 300.0, 0.0);
+    b.text = "очень длинная строка текста ".repeat(12);
+    let fx = open_canvas(cx, vec![a, b]);
+    // Первые кадры подгоняют высоту карточки под текст…
+    for _ in 0..3 {
+        act(cx, &fx, |w, cx| {
+            w.simulate_next_frame(cx);
+        });
+    }
+    // …а дальше всё стоит: кадр не просит следующего. Иначе окно
+    // перерисовывалось бы без конца и тормозило всё остальное.
+    let asked = cx
+        .update_window(fx.handle, |_, w, cx| {
+            w.render_frame(cx);
+            w.simulate_next_frame(cx)
+        })
+        .unwrap();
+    assert_eq!(asked, 0, "спокойный холст сам себя не перерисовывает");
 }

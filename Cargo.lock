@@ -720,6 +720,7 @@ dependencies = [
  "bolh-core",
  "chrono",
  "dirs 6.0.0",
+ "futures",
  "gpui-kit",
  "minreq",
  "semver",

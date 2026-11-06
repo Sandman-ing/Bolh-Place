@@ -3,11 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use bolh_core::format::{Content, FileKind, Node};
+use bolh_core::rich::{Block, Kind, RichText};
 use bolh_core::settings::Settings;
 use bolh_core::space::{Clock, Space};
 use bolh_place::canvas_view::Tool;
 use bolh_place::workspace::Workspace;
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{ClickOptions, TestWindowExt};
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Entity, ScrollDelta, TestAppContext, WindowBounds,
     WindowOptions, point, px, size,
@@ -150,7 +151,7 @@ fn double_click_creates_card_and_typed_text_is_saved(cx: &mut TestAppContext) {
     save_now(cx, &fx);
     let disk = nodes_on_disk(&fx);
     assert_eq!(disk.len(), 1);
-    assert_eq!(disk[0].text, "План на неделю");
+    assert_eq!(disk[0].plain_text(), "План на неделю");
     assert_eq!(disk[0].kind, "card");
 }
 
@@ -322,7 +323,7 @@ fn click_inside_edited_card_keeps_editing(cx: &mut TestAppContext) {
         "щелчок внутри карточки не прерывает правку"
     );
     act(cx, &fx, |w, cx| w.input("два", cx));
-    assert!(nodes_in_view(cx, &fx)[0].text.contains("два"));
+    assert!(nodes_in_view(cx, &fx)[0].plain_text().contains("два"));
 }
 
 #[gpui_kit::test]
@@ -390,13 +391,13 @@ fn long_text_makes_card_taller_on_screen_but_not_in_the_file(cx: &mut TestAppCon
     // карточка не растёт сама при каждом открытии.
     save_now(cx, &fx);
     assert_eq!(nodes_on_disk(&fx)[0].height, 140.0);
-    assert_eq!(nodes_on_disk(&fx)[0].text, long);
+    assert_eq!(nodes_on_disk(&fx)[0].plain_text(), long);
 }
 
 #[gpui_kit::test]
 fn shrinking_a_card_by_its_corner_works_and_saves_once(cx: &mut TestAppContext) {
     let mut a = card("a", 0.0, 0.0);
-    a.text = "коротко".into();
+    a.set_plain_text("коротко");
     let fx = open_canvas(cx, vec![a]);
     let view = cx.read(|cx| {
         fx.ws
@@ -480,9 +481,9 @@ fn own_save_during_a_check_is_not_taken_for_a_change_elsewhere(cx: &mut TestAppC
 #[gpui_kit::test]
 fn calm_canvas_does_not_redraw_by_itself(cx: &mut TestAppContext) {
     let mut a = card("a", 0.0, 0.0);
-    a.text = "коротко".into();
+    a.set_plain_text("коротко");
     let mut b = card("b", 300.0, 0.0);
-    b.text = "очень длинная строка текста ".repeat(12);
+    b.set_plain_text(&"очень длинная строка текста ".repeat(12));
     let fx = open_canvas(cx, vec![a, b]);
     // Первые кадры подгоняют высоту карточки под текст…
     for _ in 0..3 {
@@ -645,4 +646,213 @@ fn undo_and_redo_buttons(cx: &mut TestAppContext) {
     assert_eq!(nodes_in_view(cx, &fx)[0].x, 0.0, "отменено");
     act(cx, &fx, |w, cx| w.click("canvas-redo", cx));
     assert_eq!(nodes_in_view(cx, &fx)[0].x, 1.0, "повторено");
+}
+
+/// Печатает по одному знаку, как человек: быстрые «- » и «[] » срабатывают
+/// на пробеле.
+fn type_chars(cx: &mut TestAppContext, fx: &Fx, text: &str) {
+    for ch in text.chars() {
+        let ch = ch.to_string();
+        act(cx, fx, |w, cx| w.input(&ch, cx));
+    }
+}
+
+fn rich_in_view(cx: &mut TestAppContext, fx: &Fx, i: usize) -> RichText {
+    nodes_in_view(cx, fx)[i].rich.clone()
+}
+
+fn kinds(r: &RichText) -> Vec<Kind> {
+    r.blocks.iter().map(|b| b.kind).collect()
+}
+
+#[gpui_kit::test]
+fn checklist_typed_with_brackets_is_saved_with_its_blocks(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    type_chars(cx, &fx, "# План");
+    act(cx, &fx, |w, cx| w.press("enter", cx));
+    type_chars(cx, &fx, "[] молоко");
+    act(cx, &fx, |w, cx| w.press("enter", cx));
+    type_chars(cx, &fx, "хлеб");
+    act(cx, &fx, |w, cx| w.press("escape", cx));
+    let r = rich_in_view(cx, &fx, 0);
+    assert_eq!(
+        kinds(&r),
+        [Kind::Heading(1), Kind::Check(false), Kind::Check(false)]
+    );
+    assert_eq!(r.plain_text(), "План\nмолоко\nхлеб");
+    save_now(cx, &fx);
+    let disk = nodes_on_disk(&fx);
+    assert_eq!(disk[0].rich, r, "в файле то же самое");
+    let json = std::fs::read_to_string(fx.root.join(REL)).unwrap();
+    assert!(json.contains("\"blocks\""), "оформление в файле");
+    assert!(json.contains("\"version\": 2"), "холст новой версии");
+}
+
+#[gpui_kit::test]
+fn plain_typing_keeps_the_file_plain(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    type_chars(cx, &fx, "просто");
+    act(cx, &fx, |w, cx| w.press("escape", cx));
+    save_now(cx, &fx);
+    let json = std::fs::read_to_string(fx.root.join(REL)).unwrap();
+    assert!(json.contains("\"text\": \"просто\""));
+    assert!(
+        !json.contains("\"blocks\""),
+        "без оформления — только текст"
+    );
+}
+
+#[gpui_kit::test]
+fn bold_by_keys_and_italic_from_the_format_bar(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    type_chars(cx, &fx, "важно");
+    act(cx, &fx, |w, cx| w.press("ctrl-a", cx));
+    act(cx, &fx, |w, cx| w.press("ctrl-b", cx));
+    act(cx, &fx, |w, cx| w.click("canvas-italic", cx));
+    let r = rich_in_view(cx, &fx, 0);
+    let span = &r.blocks[0].spans[0];
+    assert_eq!(span.text, "важно");
+    assert!(span.marks.bold && span.marks.italic, "{:?}", span.marks);
+    assert!(editing(cx, &fx), "кнопка панели не прервала правку");
+    // Дальше набор идёт тем же оформлением.
+    act(cx, &fx, |w, cx| w.press("end", cx));
+    type_chars(cx, &fx, "!");
+    let r = rich_in_view(cx, &fx, 0);
+    assert_eq!(r.blocks[0].spans.len(), 1, "«!» тоже жирный курсив");
+    // Кнопка списка с панели.
+    act(cx, &fx, |w, cx| w.click("canvas-checklist", cx));
+    assert_eq!(kinds(&rich_in_view(cx, &fx, 0)), [Kind::Check(false)]);
+}
+
+fn checklist_card(id: &str, items: &[(&str, bool)]) -> Node {
+    let mut n = card(id, 0.0, 0.0);
+    n.rich = RichText::from_blocks(
+        items
+            .iter()
+            .map(|(t, done)| Block::new(Kind::Check(*done)).with_text(*t))
+            .collect(),
+    );
+    n
+}
+
+#[gpui_kit::test]
+fn clicking_a_checkbox_ticks_it_without_editing_and_undo_unticks(cx: &mut TestAppContext) {
+    let fx = open_canvas(
+        cx,
+        vec![checklist_card("a", &[("молоко", false), ("хлеб", false)])],
+    );
+    act(cx, &fx, |_, _| {});
+    // Квадрат первого пункта: рамка 1 + отступ 12, по высоте — середина
+    // первой строки.
+    act(cx, &fx, |w, cx| {
+        w.click_at("node:a", point(px(21.), px(24.)), cx)
+    });
+    let r = rich_in_view(cx, &fx, 0);
+    assert_eq!(kinds(&r), [Kind::Check(true), Kind::Check(false)]);
+    assert!(!editing(cx, &fx), "галочка не начинает правку");
+    let selected = cx.read(|cx| {
+        let ws = fx.ws.read(cx);
+        let v = ws.active_tab().unwrap().canvas_view().unwrap().read(cx);
+        v.editor().selection().len()
+    });
+    assert_eq!(selected, 0, "и не выделяет карточку");
+    save_now(cx, &fx);
+    assert_eq!(kinds(&nodes_on_disk(&fx)[0].rich)[0], Kind::Check(true));
+    act(cx, &fx, |w, cx| w.press("ctrl-z", cx));
+    assert_eq!(kinds(&rich_in_view(cx, &fx, 0))[0], Kind::Check(false));
+}
+
+#[gpui_kit::test]
+fn checklist_tool_places_a_card_with_an_empty_item(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.press("l", cx));
+    assert_eq!(tool(cx, &fx), Tool::Checklist);
+    act(cx, &fx, |w, cx| {
+        w.click_at("canvas", point(px(60.), px(60.)), cx)
+    });
+    assert!(editing(cx, &fx));
+    type_chars(cx, &fx, "купить");
+    act(cx, &fx, |w, cx| w.press("enter", cx));
+    type_chars(cx, &fx, "позвонить");
+    let r = rich_in_view(cx, &fx, 1);
+    assert_eq!(kinds(&r), [Kind::Check(false), Kind::Check(false)]);
+    assert_eq!(r.plain_text(), "купить\nпозвонить");
+    assert_eq!(tool(cx, &fx), Tool::Select);
+}
+
+#[gpui_kit::test]
+fn double_click_puts_the_caret_where_clicked(cx: &mut TestAppContext) {
+    let mut a = card("a", 0.0, 0.0);
+    a.set_plain_text("раз два");
+    let fx = open_canvas(cx, vec![a]);
+    act(cx, &fx, |_, _| {});
+    // У самого начала текста.
+    act(cx, &fx, |w, cx| {
+        let at = ClickOptions::new()
+            .with_offset(point(px(14.), px(24.)))
+            .with_count(2);
+        w.click_with_options("node:a", at, cx)
+    });
+    type_chars(cx, &fx, "X");
+    assert_eq!(rich_in_view(cx, &fx, 0).plain_text(), "Xраз два");
+}
+
+#[gpui_kit::test]
+fn copy_and_paste_inside_text_keep_formatting(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    type_chars(cx, &fx, "ж");
+    act(cx, &fx, |w, cx| w.press("ctrl-a", cx));
+    act(cx, &fx, |w, cx| w.press("ctrl-b", cx));
+    act(cx, &fx, |w, cx| w.press("ctrl-c", cx));
+    act(cx, &fx, |w, cx| w.press("ctrl-end", cx));
+    act(cx, &fx, |w, cx| w.press("ctrl-b", cx));
+    type_chars(cx, &fx, " о ");
+    act(cx, &fx, |w, cx| w.press("ctrl-v", cx));
+    let r = rich_in_view(cx, &fx, 0);
+    assert_eq!(r.plain_text(), "ж о ж");
+    let bold: Vec<bool> = r.blocks[0].spans.iter().map(|s| s.marks.bold).collect();
+    assert_eq!(bold, [true, false, true], "вставленное — жирное");
+}
+
+#[gpui_kit::test]
+fn undo_inside_text_then_whole_edit_on_the_canvas(cx: &mut TestAppContext) {
+    let mut a = card("a", 0.0, 0.0);
+    a.set_plain_text("было");
+    let fx = open_canvas(cx, vec![a]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    act(cx, &fx, |w, cx| w.press("ctrl-end", cx));
+    type_chars(cx, &fx, "abc");
+    act(cx, &fx, |w, cx| w.press("ctrl-z", cx));
+    assert_eq!(
+        rich_in_view(cx, &fx, 0).plain_text(),
+        "было",
+        "отмена внутри текста"
+    );
+    type_chars(cx, &fx, "x");
+    act(cx, &fx, |w, cx| w.press("escape", cx));
+    assert_eq!(rich_in_view(cx, &fx, 0).plain_text(), "былоx");
+    // Вне правки Ctrl+Z отменяет всю правку текста разом.
+    act(cx, &fx, |w, cx| w.press("ctrl-z", cx));
+    assert_eq!(rich_in_view(cx, &fx, 0).plain_text(), "было");
+}
+
+#[gpui_kit::test]
+fn tab_nests_a_list_item_and_numbers_follow(cx: &mut TestAppContext) {
+    let fx = open_canvas(cx, vec![card("a", 0.0, 0.0)]);
+    act(cx, &fx, |w, cx| w.double_click("node:a", cx));
+    type_chars(cx, &fx, "1. раз");
+    act(cx, &fx, |w, cx| w.press("enter", cx));
+    type_chars(cx, &fx, "вложенный");
+    act(cx, &fx, |w, cx| w.press("tab", cx));
+    act(cx, &fx, |w, cx| w.press("enter", cx));
+    act(cx, &fx, |w, cx| w.press("shift-tab", cx));
+    type_chars(cx, &fx, "два");
+    let r = rich_in_view(cx, &fx, 0);
+    let indents: Vec<u8> = r.blocks.iter().map(|b| b.indent).collect();
+    assert_eq!(indents, [0, 1, 0]);
+    assert_eq!(r.numbers(), [Some(1), Some(1), Some(2)]);
 }

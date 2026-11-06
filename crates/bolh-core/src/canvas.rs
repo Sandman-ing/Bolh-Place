@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::format::{Canvas, Node};
+use crate::rich::RichText;
 
 /// Шаг сетки. Кратен шагу 4 из дизайн-токенов.
 pub const GRID: f64 = 20.0;
@@ -353,9 +354,11 @@ impl Editor {
             .collect();
     }
 
-    /// Холст со всеми правками — для сохранения.
+    /// Холст со всеми правками — для сохранения. Версия — текущая: в нём
+    /// могут быть карточки с оформлением.
     pub fn to_canvas(&self) -> Canvas {
         let mut c = self.meta.clone();
+        c.version = c.version.max(crate::format::CANVAS_VERSION);
         c.nodes = self.nodes.iter().map(|n| (**n).clone()).collect();
         c
     }
@@ -581,12 +584,29 @@ impl Editor {
 
     /// Меняет текст карточки. Точку отмены ставит вызывающий — один раз за
     /// всё время правки текста, а не на каждую букву.
-    pub fn set_text(&mut self, id: &str, text: &str) {
-        if let Some(n) = self.node_mut(id)
-            && n.text != text
+    /// Меняет текст объекта. Точку отмены ставит вызывающий: правка текста
+    /// карточки — один шаг от начала до конца.
+    pub fn set_rich(&mut self, id: &str, rich: &RichText) {
+        if self.node(id).is_some_and(|n| &n.rich != rich)
+            && let Some(n) = self.node_mut(id)
         {
-            n.text = text.to_string();
+            n.rich = rich.clone();
         }
+    }
+
+    /// Отмечает пункт чек-листа щелчком вне правки текста — отдельный шаг
+    /// отмены. `false`, если там не пункт чек-листа.
+    pub fn toggle_check(&mut self, id: &str, block: usize) -> bool {
+        let is_check = self
+            .node(id)
+            .and_then(|n| n.rich.blocks.get(block))
+            .is_some_and(|b| matches!(b.kind, crate::rich::Kind::Check(_)));
+        if !is_check {
+            return false;
+        }
+        self.checkpoint();
+        let n = self.node_mut(id).expect("проверено выше");
+        crate::rich::toggle_check(&mut n.rich, block)
     }
 
     /// Меняет объект целиком через функцию. Точку отмены ставит вызывающий.
@@ -734,6 +754,19 @@ impl Editor {
         self.set_selection(selection);
         self.keep_selection_valid();
     }
+}
+
+/// Текст карточек, скопированных на холсте, — если их вставляют внутрь
+/// текста другой карточки. Не наш буфер или карточки без текста — `None`.
+pub fn clip_text(text: &str) -> Option<RichText> {
+    let clip = serde_json::from_str::<Clip>(text).ok()?;
+    let blocks: Vec<_> = clip
+        .nodes
+        .into_iter()
+        .filter(|n| n.has_text())
+        .flat_map(|n| n.rich.blocks)
+        .collect();
+    (!blocks.is_empty()).then(|| RichText::from_blocks(blocks))
 }
 
 #[cfg(test)]
@@ -917,13 +950,13 @@ mod tests {
     fn copy_paste_gives_new_ids_and_offset() {
         let mut e = ed();
         let a = e.add_card(p(0.0, 0.0), None);
-        e.set_text(&a, "текст");
+        e.set_rich(&a, &RichText::from_plain("текст"));
         let clip = e.copy_selection().unwrap();
         assert!(e.paste(&clip, 20.0));
         assert_eq!(e.nodes().len(), 2);
         let pasted = &e.nodes()[1];
         assert_ne!(pasted.id, a);
-        assert_eq!(pasted.text, "текст");
+        assert_eq!(pasted.plain_text(), "текст");
         assert_eq!(pasted.x, e.nodes()[0].x + 20.0);
         assert_eq!(e.selection(), std::slice::from_ref(&pasted.id));
         assert!(e.duplicate());
@@ -1107,5 +1140,37 @@ mod tests {
         assert!(v.zoom < 0.1 + 1e-9);
         let vis = v.visible(1000.0, 800.0);
         assert!(vis.contains(p(0.0, 50.0)));
+    }
+
+    #[test]
+    fn checkbox_click_is_its_own_undo_step() {
+        use crate::rich::{Block, Kind};
+        let mut e = ed();
+        let a = e.add_card(p(0.0, 0.0), None);
+        let list = RichText::from_blocks(vec![
+            Block::new(Kind::Check(false)).with_text("молоко"),
+            Block::paragraph("абзац"),
+        ]);
+        e.set_rich(&a, &list);
+        assert!(e.toggle_check(&a, 0));
+        assert_eq!(e.node(&a).unwrap().rich.blocks[0].kind, Kind::Check(true));
+        assert!(!e.toggle_check(&a, 1), "абзац не отмечается");
+        assert!(!e.toggle_check("нет такой", 0));
+        assert!(e.undo());
+        assert_eq!(e.node(&a).unwrap().rich.blocks[0].kind, Kind::Check(false));
+    }
+
+    #[test]
+    fn copied_cards_paste_into_text_as_their_text() {
+        let mut e = ed();
+        let a = e.add_card(p(0.0, 0.0), None);
+        e.set_rich(&a, &RichText::from_plain("раз\nдва"));
+        let b = e.add_card(p(300.0, 0.0), None);
+        e.set_rich(&b, &RichText::from_plain("три"));
+        e.add_card(p(600.0, 0.0), None);
+        e.select_all();
+        let clip = e.copy_selection().unwrap();
+        assert_eq!(clip_text(&clip).unwrap().plain_text(), "раз\nдва\nтри");
+        assert_eq!(clip_text("обычный текст"), None);
     }
 }

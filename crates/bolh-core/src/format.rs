@@ -10,20 +10,27 @@
 
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+use crate::rich::{Block as RichBlock, RichText};
 
 pub const DOC_EXT: &str = "bdoc";
 pub const CANVAS_EXT: &str = "bcanvas";
 const DOC_FORMAT: &str = "bolh-doc";
 const CANVAS_FORMAT: &str = "bolh-canvas";
 
-/// Версия формата, которую пишет эта программа. Файл с большей версией
-/// открывается только для чтения: перезапись потеряла бы новые данные.
-pub const FORMAT_VERSION: u32 = 1;
+/// Версия формата документа, которую пишет эта программа. Файл с большей
+/// версией открывается только для чтения: перезапись потеряла бы новые
+/// данные.
+pub const DOC_VERSION: u32 = 1;
+/// То же для холста. Версия 2 — карточки с оформленным текстом. Холст
+/// версии 1 читается как есть и записывается уже версией 2: программа 0.2,
+/// увидев 2, откроет его только для чтения и не сотрёт оформление, которого
+/// не понимает.
+pub const CANVAS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
@@ -86,7 +93,7 @@ impl Document {
     pub fn new() -> Self {
         Document {
             format: DOC_FORMAT.into(),
-            version: FORMAT_VERSION,
+            version: DOC_VERSION,
             id: Uuid::new_v4(),
             blocks: Vec::new(),
             extra: Map::new(),
@@ -133,6 +140,7 @@ impl Default for Document {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Canvas {
     pub format: String,
+    #[serde(serialize_with = "write_canvas_version")]
     pub version: u32,
     pub id: Uuid,
     /// Объекты холста по порядку слоёв: последний — сверху.
@@ -144,11 +152,17 @@ pub struct Canvas {
     pub extra: Map<String, Value>,
 }
 
+/// Холст всегда пишется не ниже текущей версии: в нём могут быть карточки
+/// с оформлением.
+fn write_canvas_version<S: Serializer>(v: &u32, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_u32((*v).max(CANVAS_VERSION))
+}
+
 impl Canvas {
     pub fn new() -> Self {
         Canvas {
             format: CANVAS_FORMAT.into(),
-            version: FORMAT_VERSION,
+            version: CANVAS_VERSION,
             id: Uuid::new_v4(),
             nodes: Vec::new(),
             edges: Vec::new(),
@@ -165,25 +179,23 @@ impl Default for Canvas {
 
 /// Объект на холсте. Поля координат названы как в формате JSON Canvas,
 /// чтобы экспорт для Obsidian (раздел 8) был простым.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Текст в файле лежит в двух видах. `text` — простой, без оформления: его
+/// видно глазами, по нему ищут, его показывает старая версия программы.
+/// `blocks` — с оформлением и списками; пишется, только если оформление
+/// есть, и при чтении главнее `text`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
-    #[serde(default)]
     pub id: String,
     /// Вид объекта: `card` — карточка. Неизвестные виды от новых версий
     /// программы хранятся как есть.
-    #[serde(rename = "type", default)]
     pub kind: String,
-    #[serde(default)]
     pub x: f64,
-    #[serde(default)]
     pub y: f64,
-    #[serde(default)]
     pub width: f64,
-    #[serde(default)]
     pub height: f64,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub text: String,
-    #[serde(flatten)]
+    /// Текст объекта с оформлением.
+    pub rich: RichText,
     pub extra: Map<String, Value>,
 }
 
@@ -198,9 +210,98 @@ impl Node {
             y,
             width,
             height,
-            text: String::new(),
+            rich: RichText::default(),
             extra: Map::new(),
         }
+    }
+
+    /// Текст без оформления.
+    pub fn plain_text(&self) -> String {
+        self.rich.plain_text()
+    }
+
+    pub fn set_plain_text(&mut self, text: &str) {
+        self.rich = RichText::from_plain(text);
+    }
+
+    pub fn has_text(&self) -> bool {
+        !self.rich.is_empty()
+    }
+}
+
+#[derive(Serialize)]
+struct NodeOut<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocks: Option<&'a [RichBlock]>,
+    #[serde(flatten)]
+    extra: &'a Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct NodeIn {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    blocks: Option<Vec<RichBlock>>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl Serialize for Node {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        NodeOut {
+            id: &self.id,
+            kind: &self.kind,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            text: self.rich.plain_text(),
+            blocks: (!self.rich.is_plain()).then_some(&self.rich.blocks[..]),
+            extra: &self.extra,
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let n = NodeIn::deserialize(d)?;
+        let rich = match n.blocks {
+            Some(blocks) if !blocks.is_empty() => RichText::from_blocks(blocks),
+            _ => RichText::from_plain(&n.text),
+        };
+        Ok(Node {
+            id: n.id,
+            kind: n.kind,
+            x: n.x,
+            y: n.y,
+            width: n.width,
+            height: n.height,
+            rich,
+            extra: n.extra,
+        })
     }
 }
 
@@ -249,7 +350,10 @@ impl Content {
 
     /// Можно ли сохранять: файл более новой версии формата только читается.
     pub fn is_writable(&self) -> bool {
-        self.version() <= FORMAT_VERSION
+        match self {
+            Content::Document(d) => d.version <= DOC_VERSION,
+            Content::Canvas(c) => c.version <= CANVAS_VERSION,
+        }
     }
 
     /// Байты для записи на диск: JSON с отступами, переводы строк `\n`,
@@ -297,10 +401,9 @@ impl Content {
                 Content::Canvas(serde_json::from_value(head).map_err(|e| corrupt(e.to_string()))?)
             }
         };
-        if version > FORMAT_VERSION {
-            // Разобрать удалось, но писать нельзя — это видно по is_writable.
-            debug_assert!(!content.is_writable());
-        }
+        // Разобрать удалось и у более новой версии, но писать её нельзя —
+        // это видно по is_writable.
+        debug_assert_eq!(content.version(), version);
         Ok(content)
     }
 }
@@ -328,7 +431,7 @@ mod tests {
     fn canvas_round_trip_keeps_unknown_objects() {
         let text = r#"{
   "format": "bolh-canvas",
-  "version": 1,
+  "version": 2,
   "id": "1b4e28ba-2fa1-11d2-883f-0016d3cca427",
   "nodes": [{"id": "a", "x": 10, "y": -5, "kind": "card"}],
   "edges": [],
@@ -343,6 +446,59 @@ mod tests {
         assert!(s.contains("\"kind\": \"card\""));
         let Content::Canvas(cv) = &c else { panic!() };
         assert_eq!((cv.nodes[0].x, cv.nodes[0].y), (10.0, -5.0));
+    }
+
+    #[test]
+    fn canvas_of_version_1_is_read_and_written_as_version_2() {
+        let text = r#"{"format":"bolh-canvas","version":1,"id":"1b4e28ba-2fa1-11d2-883f-0016d3cca427",
+            "nodes":[{"id":"a","type":"card","x":0,"y":0,"width":240,"height":140,"text":"раз\nдва"}]}"#;
+        let c = Content::parse(FileKind::Canvas, text.as_bytes(), p()).unwrap();
+        assert!(c.is_writable(), "холст от версии 0.2 правится");
+        let Content::Canvas(cv) = &c else { panic!() };
+        assert_eq!(cv.nodes[0].plain_text(), "раз\nдва");
+        let again = Content::parse(FileKind::Canvas, &c.to_bytes(), p()).unwrap();
+        assert_eq!(again.version(), CANVAS_VERSION);
+        // Холст новее этой программы — только для чтения.
+        let newer = text.replace("\"version\":1", "\"version\":3");
+        let c = Content::parse(FileKind::Canvas, newer.as_bytes(), p()).unwrap();
+        assert!(!c.is_writable());
+    }
+
+    #[test]
+    fn card_text_is_plain_in_the_file_unless_it_has_formatting() {
+        use crate::rich::{Block as B, Kind, Mark, Marks, Span};
+        let mut n = Node::card("a", 0.0, 0.0, 240.0, 140.0);
+        n.set_plain_text("раз\nдва");
+        let json = serde_json::to_value(&n).unwrap();
+        assert_eq!(json["text"], "раз\nдва");
+        assert!(json.get("blocks").is_none(), "без оформления — только text");
+
+        n.rich.blocks = vec![
+            B::new(Kind::Check(true)).with_text("молоко"),
+            B {
+                spans: vec![Span {
+                    text: "важно".into(),
+                    marks: Marks::default().with(Mark::Bold, true),
+                }],
+                ..B::new(Kind::Paragraph)
+            },
+        ];
+        let json = serde_json::to_value(&n).unwrap();
+        assert_eq!(json["text"], "молоко\nважно", "простой текст остаётся");
+        assert_eq!(json["blocks"][0]["type"], "check");
+        assert_eq!(json["blocks"][1]["spans"][0]["bold"], true);
+        let back: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(back, n);
+
+        // При чтении оформленный текст главнее простого.
+        let mut json = serde_json::to_value(&n).unwrap();
+        json["text"] = "устарело".into();
+        let back: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(back.plain_text(), "молоко\nважно");
+
+        // Пустая карточка пишется без текста вовсе.
+        let empty = serde_json::to_value(Node::card("b", 0.0, 0.0, 1.0, 1.0)).unwrap();
+        assert!(empty.get("text").is_none() && empty.get("blocks").is_none());
     }
 
     #[test]

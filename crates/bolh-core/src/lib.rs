@@ -8,6 +8,7 @@ pub mod format;
 pub mod fsutil;
 pub mod history;
 pub mod i18n;
+pub mod rich;
 pub mod settings;
 pub mod space;
 pub mod trash;

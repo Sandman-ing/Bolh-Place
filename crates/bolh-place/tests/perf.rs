@@ -46,7 +46,7 @@ fn open_big(
                 240.0,
                 140.0,
             );
-            card.text = format!("Карточка {i}: купить, позвонить, сделать");
+            card.set_plain_text(&format!("Карточка {i}: купить, позвонить, сделать"));
             c.nodes.push(card);
         }
     }

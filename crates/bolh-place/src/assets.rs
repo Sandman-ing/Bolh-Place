@@ -9,19 +9,27 @@ use gpui_kit::{AssetSource, SharedString};
 gpui_kit::assets::icon_assets!(
     pub ExtraIcons,
     [
+        Bold,
         Download,
         FilePlus,
         FolderInput,
         FolderPlus,
         Grid3x3,
         Hand,
+        Heading1,
+        Italic,
         Languages,
+        List,
+        ListChecks,
+        ListOrdered,
         Monitor,
         MousePointer2,
         RotateCcw,
         Shapes,
         StickyNote,
+        Strikethrough,
         Trash,
+        Underline,
         X
     ]
 );

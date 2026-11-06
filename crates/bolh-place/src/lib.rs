@@ -4,9 +4,11 @@
 pub mod actions;
 pub mod assets;
 pub mod canvas_view;
+pub mod card_editor;
 pub mod i18n;
 pub mod palette;
 pub mod paths;
+pub mod rich_text;
 pub mod theme;
 pub mod updater;
 pub mod workspace;
@@ -29,6 +31,7 @@ pub fn init(settings: &Settings, cx: &mut App) {
     theme::init(cx);
     actions::bind_keys(cx);
     canvas_view::bind_keys(cx);
+    card_editor::bind_keys(cx);
 }
 
 /// Начальный размер окна: 1280×820, но не больше 90% ширины и 85% высоты

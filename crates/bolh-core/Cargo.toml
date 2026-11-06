@@ -14,6 +14,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 thiserror = "2.0.21"
 toml = { version = "0.9.8", default-features = false, features = ["parse", "serde"] }
+# Границы букв: курсор и Backspace не режут эмодзи и буквы со значками.
+unicode-segmentation = "1.13.3"
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
 
 [dev-dependencies]

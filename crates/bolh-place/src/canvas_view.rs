@@ -9,9 +9,9 @@ use std::rc::Rc;
 
 use bolh_core::canvas::{self, Editor, Guide, Point, Rect, View};
 use bolh_core::format::Canvas;
+use bolh_core::rich::{Block, Kind, Mark, RichText};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
@@ -25,7 +25,9 @@ use gpui_kit::{
     prelude::FluentBuilder as _, px, size,
 };
 
+use crate::card_editor::{self, CardEditor, CardEditorEvent};
 use crate::i18n::tr;
+use crate::rich_text::{CardLayouts, RichColors, RichTextElement};
 
 pub const CONTEXT: &str = "Canvas";
 /// Клавиши холста — только пока в карточке не печатают: буквы и знаки
@@ -85,6 +87,7 @@ gpui_kit::actions!(
         ToolSelect,
         ToolHand,
         ToolCard,
+        ToolChecklist,
     ]
 );
 
@@ -127,6 +130,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("v", ToolSelect, c),
         KeyBinding::new("h", ToolHand, c),
         KeyBinding::new("c", ToolCard, c),
+        KeyBinding::new("l", ToolChecklist, c),
     ]);
 }
 
@@ -140,6 +144,8 @@ pub enum Tool {
     Hand,
     /// Поставить карточку щелчком. Поставили — снова выделение.
     Card,
+    /// То же, но в карточке сразу пустой пункт чек-листа.
+    Checklist,
 }
 
 pub enum CanvasEvent {
@@ -188,8 +194,13 @@ pub struct CanvasView {
     guides: Vec<Guide>,
     space_held: bool,
     tool: Tool,
-    /// Карточка, текст которой сейчас правится, и поле для правки.
-    editing: Option<(String, gpui_kit::Entity<TextareaState>, Subscription)>,
+    /// Карточка, текст которой сейчас правится, и правка.
+    editing: Option<(String, gpui_kit::Entity<CardEditor>, Subscription)>,
+    /// Мышью тянут выделение в тексте карточки.
+    text_drag: bool,
+    /// Вёрстка текста показанных карточек в прошлом кадре: щелчок по
+    /// квадрату чек-листа и место курсора, когда правку начинают щелчком.
+    layouts: CardLayouts,
     read_only: bool,
     /// Поставить фокус в поле текста при следующей отрисовке. Сразу нельзя:
     /// щелчок по холсту после нашего обработчика забирает фокус себе.
@@ -227,6 +238,8 @@ impl CanvasView {
             space_held: false,
             tool: Tool::Select,
             editing: None,
+            text_drag: false,
+            layouts: CardLayouts::default(),
             read_only,
             focus_editing: false,
             measured: Rc::new(RefCell::new(Vec::new())),
@@ -257,7 +270,7 @@ impl CanvasView {
     }
 
     fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
-        if tool == Tool::Card && self.read_only {
+        if matches!(tool, Tool::Card | Tool::Checklist) && self.read_only {
             return;
         }
         self.tool = tool;
@@ -329,10 +342,18 @@ impl CanvasView {
         let local = self.local(ev.position);
         let world = self.view.to_world(local);
         // Щелчок внутри карточки, текст которой правится, — это поле ввода:
-        // курсор в нужное место, выделение текста. Правку не прерываем.
-        if let Some((id, ..)) = &self.editing
+        // курсор в нужное место, выделение текста, галочка. Правку не
+        // прерываем.
+        if let Some((id, text, _)) = &self.editing
             && self.editor.hit(world) == Some(id.as_str())
         {
+            if ev.button == MouseButton::Left {
+                let (shift, clicks) = (ev.modifiers.shift, ev.click_count);
+                text.update(cx, |t, cx| {
+                    t.mouse_down(ev.position, shift, clicks, window, cx)
+                });
+                self.text_drag = true;
+            }
             // Щелчок ниже текста холст забрал бы фокус себе — вернём его полю.
             self.focus_editing = true;
             cx.notify();
@@ -352,11 +373,15 @@ impl CanvasView {
         if self.read_only {
             return;
         }
-        if self.tool == Tool::Card {
+        if matches!(self.tool, Tool::Card | Tool::Checklist) {
             let id = self.editor.add_card(world, self.grid_step());
+            if self.tool == Tool::Checklist {
+                let list = RichText::from_blocks(vec![Block::new(Kind::Check(false))]);
+                self.editor.set_rich(&id, &list);
+            }
             self.tool = Tool::Select;
             self.changed(cx);
-            self.start_editing(&id, window, cx);
+            self.start_editing(&id, None, window, cx);
             return;
         }
         if let Some((id, corner, original)) = self.handle_at(local) {
@@ -370,11 +395,20 @@ impl CanvasView {
             return;
         }
         let add = ev.modifiers.control || ev.modifiers.shift;
+        // Щелчок по квадрату чек-листа — галочка, а не выделение карточки.
+        if let Some(id) = self.editor.hit(world).map(str::to_string)
+            && let Some(block) = self.check_under(&id, ev.position)
+        {
+            if self.editor.toggle_check(&id, block) {
+                self.changed(cx);
+            }
+            return;
+        }
         match self.editor.hit(world).map(str::to_string) {
             Some(id) => {
                 if ev.click_count >= 2 {
                     self.editor.select_only(&id);
-                    self.start_editing(&id, window, cx);
+                    self.start_editing(&id, Some(ev.position), window, cx);
                     return;
                 }
                 if add {
@@ -399,7 +433,7 @@ impl CanvasView {
                 if ev.click_count >= 2 {
                     let id = self.editor.add_card(world, self.grid_step());
                     self.changed(cx);
-                    self.start_editing(&id, window, cx);
+                    self.start_editing(&id, None, window, cx);
                     return;
                 }
                 if !add {
@@ -415,7 +449,13 @@ impl CanvasView {
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_drag
+            && let Some((_, text, _)) = &self.editing
+        {
+            text.update(cx, |t, cx| t.mouse_drag(ev.position, window, cx));
+            return;
+        }
         let local = self.local(ev.position);
         let world = self.view.to_world(local);
         // К чему прилипать — только видимые соседи; Alt — без прилипания.
@@ -530,6 +570,11 @@ impl CanvasView {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.text_drag)
+            && let Some((_, text, _)) = &self.editing
+        {
+            text.update(cx, |t, _| t.mouse_up());
+        }
         let gesture = std::mem::replace(&mut self.gesture, Gesture::None);
         self.guides.clear();
         match gesture {
@@ -602,36 +647,59 @@ impl CanvasView {
 
     // ---- Текст карточки --------------------------------------------------
 
-    fn start_editing(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Квадрат чек-листа показанной карточки под этой точкой окна.
+    fn check_under(&self, id: &str, at: gpui_kit::Point<Pixels>) -> Option<usize> {
+        let layouts = self.layouts.borrow();
+        let (layout, bounds) = layouts.get(id)?;
+        layout.check_at(at - bounds.origin)
+    }
+
+    /// Начинает правку текста карточки. `at` — где щёлкнули: туда и курсор.
+    fn start_editing(
+        &mut self,
+        id: &str,
+        at: Option<gpui_kit::Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.read_only {
             return;
         }
         let Some(node) = self.editor.node(id) else {
             return;
         };
-        let text = node.text.clone();
-        let state = cx.new(|cx| {
-            let mut s = TextareaState::new(window, cx).auto_grow(1, 400);
-            s.set_value(text, window, cx);
-            s
+        let text = node.rich.clone();
+        // Место щелчка — по вёрстке, с которой карточка была показана: текст
+        // и ширина те же.
+        let shown = at.and_then(|at| {
+            let layouts = self.layouts.borrow();
+            layouts.get(id).map(|(l, b)| (l.clone(), b.origin, at))
+        });
+        let editor = cx.new(|cx| {
+            let mut e = CardEditor::new(text, cx);
+            if let Some((layout, origin, at)) = shown {
+                e.place_caret(&layout, at, origin);
+            }
+            e
         });
         self.editor.checkpoint();
         let card = id.to_string();
-        let sub = cx.subscribe_in(&state, window, move |this, state, ev, _, cx| {
-            if matches!(ev, InputEvent::Change) {
-                let value = state.read(cx).value().to_string();
-                this.editor.set_text(&card, &value);
+        let sub = cx.subscribe_in(&editor, window, move |this, editor, ev, _, cx| match ev {
+            CardEditorEvent::Changed => {
+                let rich = editor.read(cx).text().clone();
+                this.editor.set_rich(&card, &rich);
                 this.changed(cx);
             }
         });
         self.focus_editing = true;
-        self.editing = Some((id.to_string(), state, sub));
+        self.editing = Some((id.to_string(), editor, sub));
         cx.notify();
     }
 
     /// Заканчивает правку текста. Фокус возвращается холсту: иначе он
     /// остался бы на исчезнувшем поле, и клавиши холста перестали бы работать.
     fn finish_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.text_drag = false;
         if self.editing.take().is_some() {
             self.focus_handle.focus(window, cx);
             // Ничего не набрали — точка отмены не нужна.
@@ -718,6 +786,125 @@ impl CanvasView {
 
     // ---- Отрисовка ------------------------------------------------------
 
+    /// Панель оформления над карточкой, текст которой правится: жирный,
+    /// курсив, подчёркнутый, зачёркнутый, заголовок, списки, чек-лист.
+    fn render_format_bar(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let (id, text, _) = self.editing.as_ref()?;
+        let r = self.editor.rect_of(id)?;
+        let a = self.view.to_screen(Point { x: r.x, y: r.y });
+        let b = self.view.to_screen(Point {
+            x: r.right(),
+            y: r.bottom(),
+        });
+        let (w, h) = self.size();
+        // Над карточкой; если сверху не влезает — под ней.
+        const BAR_H: f64 = 40.0;
+        const BAR_W: f64 = 330.0;
+        let top = if a.y - BAR_H - 8.0 >= 8.0 {
+            a.y - BAR_H - 8.0
+        } else {
+            (b.y + 8.0).min(h - BAR_H - 8.0).max(8.0)
+        };
+        let left = a.x.clamp(8.0, (w - BAR_W - 8.0).max(8.0));
+        let t = text.read(cx);
+        let kind = t.block_kind();
+        let marks = [
+            (Mark::Bold, "canvas-bold", IconName::Bold, "canvas.bold"),
+            (
+                Mark::Italic,
+                "canvas-italic",
+                IconName::Italic,
+                "canvas.italic",
+            ),
+            (
+                Mark::Underline,
+                "canvas-underline",
+                IconName::Underline,
+                "canvas.underline",
+            ),
+            (
+                Mark::Strike,
+                "canvas-strike",
+                IconName::Strikethrough,
+                "canvas.strike",
+            ),
+        ]
+        .map(|(mark, button, icon, tip)| {
+            let text = text.clone();
+            Button::new(button)
+                .ghost()
+                .small()
+                .icon(Icon::new(icon))
+                .selected(t.has_mark(mark))
+                .tooltip(tr(cx, tip))
+                .on_click(move |_, window, cx| {
+                    text.update(cx, |t, cx| t.toggle_mark(mark, window, cx))
+                })
+        });
+        let kinds = [
+            (
+                Kind::Heading(1),
+                "canvas-heading",
+                IconName::Heading1,
+                "canvas.heading",
+            ),
+            (
+                Kind::Bullet,
+                "canvas-bullets",
+                IconName::List,
+                "canvas.bullets",
+            ),
+            (
+                Kind::Numbered,
+                "canvas-numbers",
+                IconName::ListOrdered,
+                "canvas.numbers",
+            ),
+            (
+                Kind::Check(false),
+                "canvas-checklist",
+                IconName::ListChecks,
+                "canvas.checklist",
+            ),
+        ]
+        .map(|(k, button, icon, tip)| {
+            let text = text.clone();
+            let on = match (kind, k) {
+                (Some(Kind::Check(_)), Kind::Check(_)) => true,
+                (Some(have), want) => have == want,
+                (None, _) => false,
+            };
+            Button::new(button)
+                .ghost()
+                .small()
+                .icon(Icon::new(icon))
+                .selected(on)
+                .tooltip(tr(cx, tip))
+                .on_click(move |_, window, cx| {
+                    text.update(cx, |t, cx| t.toggle_kind(k, window, cx))
+                })
+        });
+        Some(
+            h_flex()
+                .id("canvas-format")
+                .absolute()
+                .left(px(left as f32))
+                .top(px(top as f32))
+                .gap_1()
+                .p_1()
+                .rounded(px(14.))
+                .bg(cx.theme().popover)
+                .border_1()
+                .border_color(cx.theme().input)
+                // Щелчок по панели не должен закончить правку.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(marks)
+                .child(div().w(px(1.)).h(px(20.)).mx_1().bg(cx.theme().border))
+                .children(kinds)
+                .into_any_element(),
+        )
+    }
+
     /// Панель инструментов слева: чем работает левая кнопка мыши.
     fn render_tools(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut tools = vec![
@@ -740,6 +927,12 @@ impl CanvasView {
                 "canvas-tool-card",
                 IconName::StickyNote,
                 "canvas.tool_card",
+            ));
+            tools.push((
+                Tool::Checklist,
+                "canvas-tool-checklist",
+                IconName::ListChecks,
+                "canvas.tool_checklist",
             ));
         }
         let panel = v_flex()
@@ -886,10 +1079,19 @@ impl Render for CanvasView {
         }
         if self.focus_editing {
             self.focus_editing = false;
-            if let Some((_, state, _)) = &self.editing {
-                state.focus_handle(cx).focus(window, cx);
+            if let Some((_, text, _)) = &self.editing {
+                let focus = text.read(cx).focus_handle.clone();
+                focus.focus(window, cx);
             }
         }
+        // Вёрстку соберут заново карточки этого кадра.
+        self.layouts.borrow_mut().clear();
+        let colors = RichColors {
+            muted: theme.muted_foreground,
+            accent: theme.primary,
+            on_accent: theme.primary_foreground,
+            selection: theme.primary.opacity(0.25),
+        };
         let view = self.view;
         let zoom = view.zoom;
         let visible = view.visible(w.max(1.0), h.max(1.0));
@@ -956,7 +1158,14 @@ impl Render for CanvasView {
                 .filter(|(_, r)| r.intersects(&visible))
                 .map(|(n, r)| {
                     let lines = if with_text {
-                        n.text.chars().count().div_ceil(24).min(3)
+                        let chars: usize = n
+                            .rich
+                            .blocks
+                            .iter()
+                            .flat_map(|b| &b.spans)
+                            .map(|s| s.text.chars().count())
+                            .sum();
+                        chars.div_ceil(24).min(3)
                     } else {
                         0
                     };
@@ -1038,31 +1247,26 @@ impl Render for CanvasView {
                         .text_size(px(text_px))
                         .line_height(px(text_px * 1.375))
                         .text_color(theme.foreground);
-                    if editing && let Some((_, state, _)) = &self.editing {
-                        // Тот же шрифт, что и без правки, — текст не прыгает.
+                    if editing && let Some((_, text, _)) = &self.editing {
+                        // Тот же элемент, что и без правки, — текст не прыгает.
+                        let field = div()
+                            .id("card-text")
+                            .key_context(card_editor::CONTEXT)
+                            .track_focus(&text.read(cx).focus_handle);
                         card = card.child(
-                            Textarea::new(state)
-                                .bordered(false)
-                                .appearance(false)
-                                // Без своего фона поле не рисуется вовсе.
-                                .bg(theme.popover)
-                                .text_color(theme.foreground)
-                                // Самый маленький размер поля — с минимальными
-                                // внутренними отступами (4 слева и справа), их
-                                // и гасим, чтобы текст стоял там же, где без
-                                // правки.
-                                .xsmall()
-                                .mx(px(-4.))
-                                .p_0()
-                                .text_size(px(text_px))
-                                .line_height(px(text_px * 1.375)),
+                            CardEditor::actions(field, text)
+                                .child(RichTextElement::editing(text.clone(), colors)),
                         );
-                    } else if !n.text.is_empty() {
-                        card = card.child(n.text.clone());
+                    } else if n.has_text() {
+                        card = card.child(RichTextElement::display(
+                            n.rich.clone(),
+                            colors,
+                            Some((self.layouts.clone(), n.id.clone())),
+                        ));
                     }
                     // Мерить нужно только карточки с текстом: без текста
                     // высота на экране и в файле совпадают.
-                    if editing || !n.text.is_empty() {
+                    if editing || n.has_text() {
                         let measured = self.measured.clone();
                         let id = n.id.clone();
                         let known = self.editor.rect(n).h;
@@ -1183,6 +1387,8 @@ impl Render for CanvasView {
         // начать на пустом холсте.
         let hint_key = if self.tool == Tool::Card {
             Some("canvas.place_card")
+        } else if self.tool == Tool::Checklist {
+            Some("canvas.place_checklist")
         } else if self.editor.nodes().is_empty() && !self.read_only {
             Some("canvas.hint")
         } else {
@@ -1209,6 +1415,7 @@ impl Render for CanvasView {
 
         let toolbar = self.render_toolbar(cx);
         let tools = self.render_tools(cx);
+        let format_bar = self.render_format_bar(cx);
         let has_selection = !self.editor.selection().is_empty();
         let panning = matches!(self.gesture, Gesture::Pan { .. });
         let hand = self.space_held || self.tool == Tool::Hand;
@@ -1228,7 +1435,9 @@ impl Render for CanvasView {
             .bg(theme.background)
             .when(panning, |d| d.cursor_grabbing())
             .when(hand && !panning, |d| d.cursor_grab())
-            .when(self.tool == Tool::Card, |d| d.cursor_crosshair())
+            .when(matches!(self.tool, Tool::Card | Tool::Checklist), |d| {
+                d.cursor_crosshair()
+            })
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1290,7 +1499,7 @@ impl Render for CanvasView {
             .on_action(cx.listener(|this, _: &EditText, window, cx| {
                 if let [id] = this.editor.selection() {
                     let id = id.clone();
-                    this.start_editing(&id, window, cx);
+                    this.start_editing(&id, None, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| this.nudge(-1.0, 0.0, false, cx)))
@@ -1304,6 +1513,9 @@ impl Render for CanvasView {
             .on_action(cx.listener(|this, _: &ToolSelect, _, cx| this.set_tool(Tool::Select, cx)))
             .on_action(cx.listener(|this, _: &ToolHand, _, cx| this.set_tool(Tool::Hand, cx)))
             .on_action(cx.listener(|this, _: &ToolCard, _, cx| this.set_tool(Tool::Card, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToolChecklist, _, cx| this.set_tool(Tool::Checklist, cx)),
+            )
             .context_menu(move |menu, window, cx| {
                 let _ = window;
                 if !has_selection {
@@ -1337,6 +1549,7 @@ impl Render for CanvasView {
             .children(hint)
             .child(tools)
             .child(toolbar)
+            .children(format_bar)
     }
 }
 

@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "bolh-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "minisign",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "bolh-place"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bolh-core",
  "chrono",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "bolh-sign"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bolh-core",
  "minisign",

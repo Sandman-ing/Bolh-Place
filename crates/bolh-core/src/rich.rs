@@ -467,12 +467,14 @@ impl RichText {
     // ---- Правки ----------------------------------------------------------
 
     /// Удаляет промежуток и возвращает место, где он был. Блок начала
-    /// сохраняет свой вид; удалили всё — остаётся пустой абзац.
+    /// сохраняет свой вид — стёртая последняя буква заголовка оставляет
+    /// пустой заголовок. Удалили несколько строк целиком — остаётся пустой
+    /// абзац.
     fn delete_range(&mut self, start: Pos, end: Pos) -> Pos {
         if start == end {
             return start;
         }
-        if start == Pos::default() && end == self.end() {
+        if start == Pos::default() && end == self.end() && end.block > 0 {
             *self = RichText::default();
             return Pos::default();
         }
@@ -508,17 +510,19 @@ impl RichText {
 
     /// Вставляет оформленные блоки (из буфера обмена). Первый блок
     /// вливается в блок курсора, последний принимает хвост после курсора.
-    /// Каждая новая строка — со своим видом, как у вставленного блока; в
-    /// пустую строку и первый ложится со своим видом: вставленный список
-    /// остаётся списком.
+    /// Каждая новая строка — со своим видом, как у вставленного блока. Если
+    /// вставляют несколько строк в пустую строку, первая тоже приходит со
+    /// своим видом: вставленный список остаётся списком. Кусок одной строки
+    /// вида не меняет — слово в пустом пункте чек-листа остаётся пунктом.
     fn insert_rich(&mut self, at: Pos, rich: &RichText) -> Pos {
         let mut pos = at;
+        let lines = rich.blocks.len() > 1;
         for (i, b) in rich.blocks.iter().enumerate() {
             if i > 0 {
                 pos = self.split_block(pos);
             }
             let target = &mut self.blocks[pos.block];
-            if i > 0 || target.is_empty() {
+            if i > 0 || (lines && target.is_empty()) {
                 target.kind = b.kind;
                 target.indent = b.indent;
             }
@@ -1612,6 +1616,43 @@ mod tests {
         e.select_all();
         e.backspace();
         assert_eq!(e.text(), &RichText::default());
+    }
+
+    #[test]
+    fn deleting_the_last_letter_keeps_the_kind_of_the_line() {
+        for start in ["# а", "- а", "[] а", "1. а"] {
+            let mut e = typed(start);
+            let kind = e.text().blocks[0].kind;
+            e.backspace();
+            assert_eq!(e.text().plain_text(), "", "{start:?}");
+            assert_eq!(
+                e.text().blocks[0].kind,
+                kind,
+                "{start:?}: вид строки остался"
+            );
+        }
+    }
+
+    #[test]
+    fn pasting_a_word_into_an_empty_item_keeps_the_item() {
+        let mut src = typed("купить хлеб");
+        src.select_word(Pos::new(0, 1));
+        let word = src.selected().unwrap();
+        let mut e = typed("[] ");
+        e.paste_rich(&word);
+        assert_eq!(
+            kinds(e.text()),
+            [Kind::Check(false)],
+            "пункт чек-листа остался"
+        );
+        assert_eq!(e.text().plain_text(), "купить");
+        // Несколько строк в пустую строку ложатся со своим видом.
+        let mut list = typed("[] раз\nдва");
+        list.select_all();
+        let lines = list.selected().unwrap();
+        let mut e = TextEditor::new(RichText::default());
+        e.paste_rich(&lines);
+        assert_eq!(kinds(e.text()), [Kind::Check(false), Kind::Check(false)]);
     }
 
     #[test]
